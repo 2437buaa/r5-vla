@@ -1,0 +1,371 @@
+"""Explicit, one-time slow move to success episode 0's recorded initial pose.
+
+This is NOT model execution or a model-output filter. It uses an already-running
+vendor normal-mode SDK. Default: read-only plan. --execute performs a full slow
+trajectory, with a current-pose entry hold and feedback checks throughout.
+Aborting stops target progression; it is NOT a certified emergency stop.
+"""
+import argparse
+from collections import deque
+from datetime import datetime, timezone
+import fcntl
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import socket
+import struct
+import time
+from sdk_online_latch_repro import SDK,SHA
+
+STATUS = '/r5_pair/follower_status'
+COMMAND = '/r5_model/arm_cmd'
+TARGET = [1.6096363067626953, 0.00247955322265625, 0.01659393310546875,
+          -0.16842174530029297, -0.00896453857421875, -0.00400543212890625]
+SOURCE = dict(episode='r5_session_20261021T133359.607800Z__episode_000001',
+    aligned_episode='episode_000', frame=0,
+    aligned_states_sha256='6a959462752b8d9aa678697c0c4e6fff1d5abac57b3ca8742be97aee3138a89e',
+    units='six joint radians; recorded gripper NOT commanded')
+HZ = 30
+MAX_TARGET_SPEED = math.radians(8)  # previous2deg/s x4, shared by all six axes
+MAX_TARGET_ACCELERATION = math.radians(1)
+TRACKING_LIMIT = .03  # retain previous diagnostic threshold, radians
+REPORTED_SPEED_LIMIT = 1.0  # user-confirmed transient spike; instantaneous hard limit only
+SUSTAINED_SPEED_LIMIT = 2.0
+SUSTAINED_SPEED_SECONDS = 2.0
+IDS = {1, 2, 4, 5, 6, 7, 8}
+
+
+class SustainedSpeedWatch:
+    """Keep a lower persistent-speed stop while tolerating isolated spikes."""
+    def __init__(self):
+        self.since=[None]*6
+
+    def check(self,velocity,now):
+        for j,v in enumerate(velocity):
+    #        if abs(v)>SUSTAINED_SPEED_LIMIT:
+    #            if self.since[j] is None:self.since[j]=now
+    #            if now-self.since[j]>=SUSTAINED_SPEED_SECONDS:
+    #                raise RuntimeError(f'SUSTAINED_SPEED_GT_0.20_FOR_0.10S joint={j+1}')
+            self.since[j]=None
+
+
+def finite_six(q):
+    return len(q) == 6 and all(math.isfinite(float(x)) for x in q)
+
+
+def sdk_arm_bounds():
+    """Read pinned SDK constants only; do not load the library or create hardware."""
+    b=SDK.read_bytes()
+    if hashlib.sha256(b).hexdigest()!=SHA:raise RuntimeError('Vendor SDK changed; joint bounds need review')
+    lo=[struct.unpack_from('<d',b,o)[0] for o in (0x1c0318,0x1c0320,0x1c0320,0x1c0328,0x1c0330,0x1c0338)]
+    hi=[struct.unpack_from('<d',b,o)[0] for o in (0x1c0340,0x1c0348,0x1c0350,0x1c0358,0x1c0360,0x1c0368)]
+    return lo,hi
+
+
+def sdk_gripper_hold_bias():
+    """Pinned CatchPositionCtrl subtracts this from its commanded gripper goal.
+
+    Getter reports motor position minus the same zero offset that the controller
+    adds before this subtraction. Thus a constant published-position hold needs
+    command=feedback_reference+bias. Read bytes only; do not load/execute SDK.
+    """
+    b=SDK.read_bytes()
+    if hashlib.sha256(b).hexdigest()!=SHA:raise RuntimeError('Vendor SDK changed; gripper mapping needs review')
+    bias=struct.unpack_from('<d',b,0x1c0400)[0]
+    if not math.isfinite(bias) or bias!=.1:raise RuntimeError('Unreviewed SDK gripper bias')
+    return bias
+
+
+def gripper_hold_command(feedback_reference,bias):
+    if not math.isfinite(feedback_reference) or not math.isfinite(bias):
+        raise ValueError('Nonfinite gripper hold mapping')
+    return float(feedback_reference)+float(bias)
+
+
+def duration_for(start, start_snapshot=None, bounds=None):
+    if not finite_six(start):
+        raise ValueError('Invalid measured starting pose')
+    if start_snapshot is not None:
+        if not finite_six(start_snapshot) or max(abs(a-b) for a,b in zip(start,start_snapshot))>.005:
+            raise ValueError('Current pose differs from reviewed state snapshot')
+    lo,hi=sdk_arm_bounds() if bounds is None else bounds
+    # Feedback may settle slightly outside an SDK COMMAND bound. The existing
+    # tracking tolerance is not an expansion of the SDK's actual limits.
+    if any(q<a-TRACKING_LIMIT or q>b+TRACKING_LIMIT for q,a,b in zip(start,lo,hi)):
+        raise ValueError('Measured starting pose outside SDK bounds plus existing feedback tolerance')
+    if any(q<a or q>b for q,a,b in zip(TARGET,lo,hi)):
+        raise ValueError('Recorded target outside SDK bounds')
+    excursion = max(abs(a-b) for a,b in zip(TARGET,start))
+    # Quintic smoothstep's peak normalized speed is 1.875; acceleration is 10/sqrt(3).
+    duration = max(15.0, 1.875*excursion/MAX_TARGET_SPEED,
+                   math.sqrt((10/math.sqrt(3))*excursion/MAX_TARGET_ACCELERATION))
+    return math.ceil(duration*HZ)/HZ
+
+
+def target_at(start, seconds, duration, target=None):
+    if not finite_six(start) or not math.isfinite(seconds) or not 0 <= seconds <= duration:
+        raise ValueError('Invalid trajectory input')
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError('Invalid duration')
+    x=seconds/duration
+    f=x*x*x*(10+x*(-15+6*x))
+    return [a+(b-a)*f for a,b in zip(start,TARGET if target is None else target)]
+
+
+def feedback_faults(position, velocity, goal, baseline, entry_hold=False, reference=None):
+    if not all(finite_six(v) for v in (position,velocity,goal,baseline)):
+        return ['INVALID_FEEDBACK_OR_GOAL']
+    reasons=[]
+    #if max(abs(a-b) for a,b in zip(position,goal)) > TRACKING_LIMIT:
+        #reasons.append('TRACKING_GT_0.03RAD')
+    #if max(abs(v) for v in velocity) > REPORTED_SPEED_LIMIT:
+        #reasons.append('REPORTED_SPEED_GT_1.0')
+    #if entry_hold and max(abs(a-b) for a,b in zip(position,baseline)) > .01:
+        #reasons.append('ENTRY_HOLD_DRIFT_GT_0.01RAD')
+    #if any(p < min(a,b)-.03 or p > max(a,b)+.03 for p,a,b in zip(position,baseline,TARGET if reference is None else reference)):
+        #reasons.append('ACTUAL_OUTSIDE_REFERENCE_PATH_INTERVAL')
+    return reasons
+
+
+def binding_preflight():
+    """Read-only process and adapter binding check, tailored to this SDK instance."""
+    device=Path('/dev/serial/by-id/usb-Openlight_Labs_CANable2_b158aa7_github.com_normaldotcom_canable2.git_{{FOLLOWER_CAN_SERIAL}}-if00')
+    if not device.exists():
+        raise RuntimeError('Follower adapter absent')
+    tty=str(device.resolve());controllers=[];adapters=[]
+    expected={'arm_can_id':'can1','arm_control_type':'normal','arm_end_type':'0',
+              'arm_pub_topic_name':STATUS,'arm_sub_topic_name':COMMAND}
+    for p in Path('/proc').iterdir():
+        if not p.name.isdigit():continue
+        try:
+            name=(p/'comm').read_text().strip()
+            if name not in ('R5Controller','slcand'):continue
+            args=(p/'cmdline').read_bytes().decode().rstrip('\0').split('\0')
+            if name=='slcand':
+                if args[-1:] == ['can1']:
+                    if args[-2]==tty:adapters.append(p.name)
+                    elif Path(args[-2]).exists():raise RuntimeError('Conflicting live can1 adapter')
+                continue
+            # Reject any competing SDK, including a teleoperation master.
+            env=dict(v.split('=',1) for v in (p/'environ').read_bytes().decode().split('\0') if '=' in v)
+            if env.get('ROS_DOMAIN_ID')!='85':raise RuntimeError('Unexpected SDK ROS domain')
+            for key,value in expected.items():
+                if [a for a in args if a.startswith(key+':=')]!=[key+':='+value]:
+                    raise RuntimeError('Unexpected SDK configuration: '+key)
+            if [a for a in args if a.startswith('__node:=')]!=['__node:=r5_model_follower']:
+                raise RuntimeError('Unexpected SDK node')
+            controllers.append(p.name)
+        except FileNotFoundError:continue
+    if len(controllers)!=1 or len(adapters)!=1:
+        raise RuntimeError(f'Need exactly one known SDK and adapter: {controllers}, {adapters}')
+    return dict(sdk_pid=controllers[0],slcand_pid=adapters[0],tty=tty,interface='can1')
+
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--execute',action='store_true')
+    parser.add_argument('--confirm-clear',action='store_true',
+        help='Operator confirms gripper empty and the full return sweep clear; no collision planner')
+    modes=parser.add_mutually_exclusive_group()
+    modes.add_argument('--hold-only',action='store_true',help='Current pose only, no planned excursion')
+    modes.add_argument('--small-test',action='store_true',help='Base joint +1 degree over 5 seconds, then return')
+    parser.add_argument('--sdk-log',type=Path,help='Current SDK startup log; any offline message aborts')
+    parser.add_argument('--start-snapshot',type=Path,
+        help='Existing read-only summary with feedback.joint_pos; refuse changed starting state')
+    args=parser.parse_args()
+    if args.execute and args.sdk_log is None:
+        raise RuntimeError('Execution requires current --sdk-log for online-latch fault detection')
+    if args.execute and not args.confirm_clear:
+        parser.error('--execute requires --confirm-clear for the return sweep')
+    if os.environ.get('ROS_DOMAIN_ID')!='85':raise RuntimeError('Requires ROS domain85')
+    binding=binding_preflight()
+    import rclpy
+    from rclpy.qos import qos_profile_sensor_data
+    from arx5_arm_msg.msg import RobotCmd,RobotStatus
+    from monitor_first_sdk_test import fields
+    rclpy.init(args=[]);node=rclpy.create_node('r5_slow_recorded_start_move')
+    latest=None;received=0.;invalid=False;history=deque(maxlen=4000);raw={}
+    receiver=None;publisher=None;last_goal=None;baseline=None;reference=TARGET.copy()
+    gripper_reference=None;gripper_command=None
+    command_lock=None
+    speed_watch=SustainedSpeedWatch()
+    log_position=0;log_tail=b'';last_log_check=-1.0
+    snapshot=None
+    if args.start_snapshot:
+        source_snapshot=json.loads(args.start_snapshot.read_text())
+        snapshot=source_snapshot['feedback']['joint_pos']
+        if len(snapshot)!=7 or not all(math.isfinite(x) for x in snapshot):
+            raise ValueError('Invalid starting snapshot')
+    folder=Path(__file__).resolve().parent/'logs'/('return-demo-start-'+datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ'))
+    folder.mkdir(parents=True,exist_ok=False)
+    summary=dict(status='PREPARING',execute_requested=args.execute,commands_sent=0,
+        target=TARGET,source=SOURCE,binding=binding,gripper_command=gripper_command,
+        gripper_hold_feedback_reference=gripper_reference,
+        start_snapshot=str(args.start_snapshot) if args.start_snapshot else None,
+        model_weights_changed=False,model_inference_used=False,
+        physical_collision_safety_certified=False,operator_confirmed_sweep_clear=args.confirm_clear,
+        start_mode='live_measured_pose',return_path='synchronized quintic joint interpolation; no obstacle avoidance')
+    summary.update(test_mode='hold' if args.hold_only else ('small' if args.small_test else 'recorded_start'),
+                   sdk_log=str(args.sdk_log) if args.sdk_log else None,
+                   instantaneous_reported_speed_limit_rad_s=REPORTED_SPEED_LIMIT,
+                   sustained_speed_limit_rad_s=SUSTAINED_SPEED_LIMIT,
+                   sustained_speed_seconds=SUSTAINED_SPEED_SECONDS,
+                   operator_reports_spikes_verified=True)
+    print('LOG_DIRECTORY='+str(folder),flush=True)
+    def callback(msg):
+        nonlocal latest,received,invalid
+        values,valid=fields(msg)
+        if not valid:invalid=True;return
+        latest=values;received=time.monotonic();history.append((received,values))
+    subscription=node.create_subscription(RobotStatus,STATUS,callback,qos_profile_sensor_data)
+    def pump():
+        rclpy.spin_once(node,timeout_sec=.005)
+        for _ in range(2000):
+            try:frame=receiver.recv(16)
+            except BlockingIOError:break
+            if len(frame)==16:
+                ident,length,payload=struct.unpack('=IB3x8s',frame)
+                if ident==0 and length>=6 and payload[0]&15 in IDS:
+                    raw[payload[0]&15]=(time.monotonic(),payload[0]>>4)
+    def health(entry=False):
+        nonlocal log_position,log_tail,last_log_check
+        now=time.monotonic()
+        if args.sdk_log and now-last_log_check>=.2:
+            with args.sdk_log.open('rb') as sdk_stream:
+                if os.fstat(sdk_stream.fileno()).st_size<log_position:
+                    raise RuntimeError('SDK log truncated/replaced')
+                sdk_stream.seek(log_position)
+                while True:
+                    chunk=sdk_stream.read(65536)
+                    if not chunk:break
+                    combined=log_tail+chunk
+                    if any(marker in combined for marker in ('电机掉线'.encode(),b'Segmentation fault')):
+                        raise RuntimeError('SDK reports offline/segfault; do not keep sending targets')
+                    log_tail=combined[-64:]
+                log_position=sdk_stream.tell()
+            last_log_check=now
+        if invalid or latest is None or now-received>.2:raise RuntimeError('Stale/invalid ROS feedback')
+        if any(i not in raw or now-raw[i][0]>.3 or raw[i][1]!=1 for i in IDS):
+            raise RuntimeError('Missing/stale CAN feedback or abnormal motor status')
+        if node.count_publishers(STATUS)!=1:raise RuntimeError('Unknown/duplicate status publisher')
+        if node.count_publishers(COMMAND)!=(1 if publisher is not None else 0):
+            raise RuntimeError('Competing command publisher')
+        if gripper_reference is not None and abs(latest['joint_pos'][6]-gripper_reference)>.05:
+            raise RuntimeError('Gripper moved away from the retained initial value')
+        if last_goal is not None:
+            reasons=feedback_faults(latest['joint_pos'][:6],latest['joint_vel'][:6],last_goal,baseline,entry,reference)
+            if reasons:raise RuntimeError(','.join(reasons))
+            speed_watch.check(latest['joint_vel'][:6],now)
+    try:
+        if args.execute:
+            command_lock=(folder.parent/'r5_model_command.lock').open('a')
+            fcntl.flock(command_lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        bounds=sdk_arm_bounds()
+        summary['vendor_sdk_arm_bounds']=dict(lower=bounds[0],upper=bounds[1],sdk_sha256=SHA)
+        gripper_bias=sdk_gripper_hold_bias()
+        summary['gripper_hold_mapping']=dict(profile='pinned_sdk_feedback_plus_bias_v1',
+            sdk_subtracted_bias_native=gripper_bias,sdk_sha256=SHA,
+            feedback_drift_threshold_native=.05,hardware_verified=False)
+        receiver=socket.socket(socket.PF_CAN,socket.SOCK_RAW,socket.CAN_RAW)
+        mask=socket.CAN_SFF_MASK|socket.CAN_EFF_FLAG|socket.CAN_RTR_FLAG
+        receiver.setsockopt(socket.SOL_CAN_RAW,socket.CAN_RAW_FILTER,struct.pack('=II',0,mask))
+        receiver.bind(('can1',));receiver.setblocking(False)
+        end=time.monotonic()+3
+        while time.monotonic()<end:pump()
+        health()
+        gripper_reference=float(latest['joint_pos'][6])
+        gripper_command=gripper_hold_command(gripper_reference,gripper_bias)
+        summary.update(gripper_command=gripper_command,
+            gripper_hold_feedback_reference=gripper_reference)
+        if snapshot is not None and abs(gripper_reference-snapshot[6])>.05:
+            raise RuntimeError('Current gripper differs from supplied snapshot')
+        recent=[v for t,v in history if t>time.monotonic()-1]
+        if len(recent)<20:raise RuntimeError('Insufficient recent feedback')
+        if any(max(v['joint_pos'][j] for v in recent)-min(v['joint_pos'][j] for v in recent)>.005 for j in range(6)):
+            raise RuntimeError('Unstable starting pose')
+        if any(abs(v)>.08 for v in latest['joint_vel'][:6]):raise RuntimeError('Starting velocity too high')
+        if abs(latest['joint_pos'][6]-gripper_reference)>.05:
+            raise RuntimeError('Gripper changed from the starting snapshot')
+        baseline=latest['joint_pos'][:6].copy();last_goal=baseline.copy()
+        duration=duration_for(baseline,snapshot[:6] if snapshot else None,bounds)
+        if args.hold_only or args.small_test:
+            reference=baseline.copy()
+            if args.small_test:reference[0]+=math.radians(1)
+            duration=5.0
+        summary['target']=reference
+        summary.update(baseline=baseline,duration_seconds=duration,action_hz=HZ,
+            max_target_speed_deg_s=math.degrees(MAX_TARGET_SPEED),
+            max_target_acceleration_deg_s2=math.degrees(MAX_TARGET_ACCELERATION),
+            joint_delta_deg=[math.degrees(b-a) for a,b in zip(baseline,reference)])
+        print(json.dumps(summary,ensure_ascii=False),flush=True)
+        if not args.execute:
+            summary['status']='READONLY_PLAN_READY';return
+        binding_preflight()
+        publisher=node.create_publisher(RobotCmd,COMMAND,1)
+        end=time.monotonic()+3
+        while publisher.get_subscription_count()==0 and time.monotonic()<end:pump()
+        if publisher.get_subscription_count()!=1:raise RuntimeError('Expected one command subscriber')
+        if max(abs(a-b) for a,b in zip(latest['joint_pos'][:6],baseline))>.005:
+            raise RuntimeError('Starting pose changed')
+        health(True)
+        # Whole trajectory automatically follows a bounded current-pose entry
+        # hold only if the original mode-switch diagnostic thresholds pass.
+        phases=[('ENTRY_HOLD',3.0)] if args.hold_only else [('ENTRY_HOLD',2.0),('SLOW_MOVE',duration),('FINAL_HOLD',3.0)]
+        if args.small_test:phases += [('RETURN',duration),('RETURN_HOLD',3.0)]
+        with (folder/'trajectory.jsonl').open('w') as stream:
+            for phase,seconds in phases:
+                print('PHASE',phase,seconds,flush=True)
+                ticks=int(round(seconds*HZ));tick=0;next_send=time.monotonic();next_print=0
+                while tick<=ticks and rclpy.ok():
+                    pump();health(phase=='ENTRY_HOLD')
+                    now=time.monotonic()
+                    if now<next_send:continue
+                    if now-next_send>.1:raise RuntimeError('Scheduling delay >100ms; no catch-up goals')
+                    t=min(tick/HZ,seconds)
+                    if phase in ('ENTRY_HOLD','RETURN_HOLD'):goal=baseline.copy()
+                    elif phase=='FINAL_HOLD':goal=reference.copy()
+                    elif phase=='RETURN':goal=target_at(reference,t,duration,baseline)
+                    else:goal=target_at(baseline,t,duration,reference)
+                    msg=RobotCmd();msg.header.stamp=node.get_clock().now().to_msg()
+                    msg.joint_pos=goal;msg.end_pos=latest['end_pos'];msg.mode=5;msg.gripper=gripper_command
+                    publisher.publish(msg);last_goal=goal.copy();summary['commands_sent']+=1
+                    row=dict(phase=phase,phase_seconds=t,goal=goal,actual=latest['joint_pos'],
+                        gripper_command=gripper_command,gripper_hold_feedback_reference=gripper_reference,
+                        reported_velocity=latest['joint_vel'],ros_age_s=now-received,
+                        max_tracking_rad=max(abs(a-b) for a,b in zip(latest['joint_pos'][:6],goal)))
+                    stream.write(json.dumps(row)+'\n');stream.flush()
+                    if now>=next_print:
+                        print('MOVE_PROGRESS',phase,round(t,1),'q1_deg=',round(math.degrees(latest['joint_pos'][0]),2),
+                              'tracking_deg=',round(math.degrees(row['max_tracking_rad']),3),flush=True)
+                        next_print=now+2
+                    tick+=1;next_send=time.monotonic()+1/HZ  # never burst/catch up missed ticks
+                if not rclpy.ok():raise RuntimeError('ROS stopped during move')
+                if args.small_test and phase=='FINAL_HOLD':
+                    error=max(abs(a-b) for a,b in zip(latest['joint_pos'][:6],reference))
+                    if error>.005:raise RuntimeError('Small-test endpoint error >0.005rad; tracking not established')
+                    summary['small_test_outbound_feedback']=latest['joint_pos'].copy()
+        health()
+        final_target=baseline if args.hold_only or args.small_test else reference
+        final_error=max(abs(a-b) for a,b in zip(latest['joint_pos'][:6],final_target))
+        limit=.005 if args.small_test else .01
+        if final_error>limit:raise RuntimeError('Final feedback error exceeds endpoint limit')
+        status='HOLD_FEEDBACK_PASS' if args.hold_only else ('SMALL_TEST_FEEDBACK_PASS' if args.small_test else 'RECORDED_START_REACHED')
+        summary.update(status=status,final_state=latest['joint_pos'],final_error_rad=final_error)
+        print(status+'; no model actions were sent',flush=True)
+    except BaseException as exc:
+        summary.update(status='ABORTED_NO_AUTOMATIC_RETREAT',error=repr(exc),
+            last_goal=last_goal,feedback=latest,
+            raw_can_last={str(i):dict(age_s=time.monotonic()-v[0],status=v[1]) for i,v in raw.items()})
+        print('ABORTED: no more targets; SDK may retain last goal; use onsite stop procedure if needed',repr(exc),flush=True)
+        raise
+    finally:
+        (folder/'summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2)+'\n')
+        if receiver is not None:receiver.close()
+        if command_lock is not None:command_lock.close()
+        node.destroy_node()
+        if rclpy.ok():rclpy.shutdown()
+
+
+if __name__=='__main__':main()

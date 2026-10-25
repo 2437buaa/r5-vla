@@ -1,0 +1,40 @@
+"""Paths and evidence helpers for the first R5-only training run."""
+import hashlib
+import json
+import os
+from pathlib import Path
+
+SOURCE = Path('{{LINGBOT_SOURCE}}')
+BASE = Path('{{BASE_MODEL}}')
+PYTHON = '{{TRAIN_PYTHON}}'
+ROOT = Path('{{SERVER_ROOT}}/real_robot/r5')
+TASK = 'Put the charger in the box'
+STEPS = 4000
+CAMERAS = ['/camera_1/color/image_raw', '/camera_2/color/image_raw']
+FOLLOWER = '/r5_pair/follower_status'
+SESSIONS = [
+    ROOT / 'batches/r5_session_20261021T133359.607800Z',
+    ROOT / 'batches/r5_session_20261021T151515.136814Z',
+    ROOT / 'incoming/teammate_upload_20261022/r5_session_20261021T135603.777282Z',
+    ROOT / 'incoming/teammate_upload_20261022/r5_session_20261021T142931.357998Z',
+]
+
+
+def read(path):
+    return json.loads(Path(path).read_text())
+
+
+def write(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + f'.{os.getpid()}.tmp')
+    temp.write_text(json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False) + '\n')
+    temp.replace(path)
+
+
+def sha(path):
+    h = hashlib.sha256()
+    with Path(path).open('rb') as f:
+        for block in iter(lambda: f.read(8 * 1024**2), b''):
+            h.update(block)
+    return h.hexdigest()

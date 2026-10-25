@@ -1,0 +1,22 @@
+{
+  "schema": "r5-preview-guard-v1",
+  "action_hz": 30,
+  "horizon": 50,
+  "ema_alpha": 0.2,
+  "arm_speed_deg_s": 10.0,
+  "arm_acceleration_deg_s2": 30.0,
+  "gripper_speed_native_s": 0.5,
+  "gripper_acceleration_native_s2": 1.5,
+  "arm_envelope_margin_deg": 3.0,
+  "arm_clip_allowance_deg": 5.0,
+  "gripper_clip_allowance_native": 0.5,
+  "reject_first_arm_jump_deg": 10.0,
+  "reject_adjacent_arm_jump_deg": 8.0,
+  "reject_chunk_arm_excursion_deg": 45.0,
+  "reject_first_gripper_jump_native": 1.0,
+  "reject_adjacent_gripper_jump_native": 1.0,
+  "max_guarded_arm_excursion_deg": 15.0,
+  "max_observation_age_s": 1.0,
+  "max_feedback_age_s": 0.1,
+  "note": "Conservative PREVIEW settings, not manufacturer ratings or certified safety limits. No hardware motion enable switch."
+}

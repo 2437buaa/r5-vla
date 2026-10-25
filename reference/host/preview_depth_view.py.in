@@ -1,0 +1,48 @@
+"""Native rqt depth viewer with automatic display range; no camera/robot control.
+
+Only adjusts this viewer's checkbox and title. It does not change depth pixels,
+camera settings, published topics, or recording formats.
+"""
+import sys
+from python_qt_binding.QtCore import QTimer
+from python_qt_binding.QtWidgets import QApplication, QCheckBox, QMainWindow
+from rqt_gui.main import Main
+
+
+class DepthMain(Main):
+    def create_application(self, argv):
+        app = super().create_application(argv)
+        self.attempts = 0
+        self.timer = QTimer(app)
+
+        def configure_view():
+            self.attempts += 1
+            found = False
+            for window in QApplication.topLevelWidgets():
+                boxes = window.findChildren(QCheckBox, 'dynamic_range_check_box')
+                for box in boxes:
+                    box.setChecked(True)
+                    found = True
+                if boxes and isinstance(window, QMainWindow):
+                    window.setWindowTitle('Gemini Depth - ' + sys.argv[1])
+            if found:
+                print('DEPTH_VIEW_AUTO_RANGE_ENABLED: display only; raw depth unchanged', flush=True)
+                self.timer.stop()
+            elif self.attempts >= 60:
+                print('DEPTH_VIEW_NOTE: select Dynamic depth range checkbox manually if image is dark', flush=True)
+                self.timer.stop()
+
+        self.timer.timeout.connect(configure_view)
+        self.timer.start(250)
+        return app
+
+
+def arguments(parser):
+    parser.add_argument('topic', help='Raw depth image topic')
+
+
+if __name__ == '__main__':
+    if len(sys.argv) != 2 or not sys.argv[1].endswith('/depth/image_raw'):
+        raise SystemExit('Usage: preview_depth_view.py /camera_N/depth/image_raw')
+    sys.exit(DepthMain(settings_filename='rqt_gemini_depth_preview').main(
+        sys.argv, standalone='rqt_image_view/ImageView', plugin_argument_provider=arguments))

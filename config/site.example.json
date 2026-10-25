@@ -1,0 +1,15 @@
+{
+  "ROS_WORKSPACE": "/home/robot/r5_teleop_ws",
+  "LINGBOT_SOURCE": "/srv/lingbot-vla-v2",
+  "BASE_MODEL": "/srv/models/lingbot-vla-v2-6b",
+  "TOKENIZER_MODEL": "/srv/models/Qwen3-VL-4B-Instruct",
+  "TRAIN_PYTHON": "/srv/envs/lingbotvla/bin/python",
+  "SERVER_ROOT": "/srv/r5",
+  "TRAIN_BUNDLE": "/srv/r5/real_robot/r5/training/charger_30hz_h50",
+  "DEPLOY_BUNDLE": "/srv/r5/real_robot/r5/deployment/charger_preview",
+  "DECODER_ENV": "/srv/r5/decoder",
+  "TRAIN_CONFIG_TEMPLATE": "/srv/r5/train-config.yaml",
+  "FOLLOWER_CAN_SERIAL": "REPLACE_FOLLOWER_CAN_SERIAL",
+  "MASTER_CAN_SERIAL": "REPLACE_MASTER_CAN_SERIAL",
+  "SSH_TARGET": "robot@server.example.invalid"
+}

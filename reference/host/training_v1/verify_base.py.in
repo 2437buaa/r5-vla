@@ -1,0 +1,39 @@
+"""Compare local model shards to official Hugging Face LFS SHA256 metadata."""
+import json
+from pathlib import Path
+import sys
+import ssl
+import urllib.request
+from common import BASE, read, write, sha
+
+b=Path(sys.argv[1])
+url='https://huggingface.co/api/models/robbyant/lingbot-vla-v2-6b?blobs=true'
+try:
+    if len(sys.argv)>2 and sys.argv[2]=='--frozen-official-metadata':
+        metadata=read(Path(__file__).with_name('official_base_expected.json'))
+        assert metadata['source_api']==url
+    else:
+        req=urllib.request.Request(url,headers={'User-Agent':'R5-model-provenance-check/1.0'})
+        context=ssl.create_default_context(cafile='/etc/ssl/certs/ca-certificates.crt')
+        with urllib.request.urlopen(req,timeout=25,context=context) as response:
+            metadata=json.load(response)
+    write(b/'official_base_metadata.json',metadata)
+    assert metadata['id']=='robbyant/lingbot-vla-v2-6b'
+    siblings={s['rfilename']:s for s in metadata['siblings']}
+    rows=[]
+    index=read(BASE/'model.safetensors.index.json')
+    for name in sorted(set(index['weight_map'].values())):
+        info=siblings[name]; expected=info['lfs']['sha256']
+        actual=sha(BASE/name)
+        row=dict(file=name,expected_sha256=expected,actual_sha256=actual,
+                 expected_size=info['size'],local_size=(BASE/name).stat().st_size,
+                 match=actual==expected and (BASE/name).stat().st_size==info['size'])
+        rows.append(row);print('BASE_SHARD',name,row['match'],flush=True)
+        write(b/'base_verification_progress.json',rows)
+    assert len(rows)==6 and all(r['match'] for r in rows),rows
+    write(b/'BASE_VERIFIED.json',dict(status='PASS',repo=metadata['id'],revision=metadata['sha'],
+        local_path=str(BASE),shards=rows,source_api=url))
+    print('OFFICIAL_BASE_SHA256_PASS',metadata['sha'],flush=True)
+except Exception as exc:
+    write(b/'base_verification_error.json',dict(status='NOT_VERIFIED',error=repr(exc),source_api=url))
+    raise

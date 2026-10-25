@@ -1,0 +1,51 @@
+"""Receive only, simultaneously on both CAN interfaces. No CAN send calls."""
+import collections
+import json
+import selectors
+import socket
+import struct
+import time
+
+
+def main():
+    selector = selectors.DefaultSelector()
+    counters = {name: collections.Counter() for name in ('can0', 'can1')}
+    sockets = []
+    try:
+        for name in counters:
+            channel = socket.socket(socket.PF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
+            sockets.append(channel)
+            # Only standard, non-RTR CAN ID 0, used by the inspected SDK feedback parser.
+            mask = socket.CAN_SFF_MASK | socket.CAN_EFF_FLAG | socket.CAN_RTR_FLAG
+            channel.setsockopt(socket.SOL_CAN_RAW, socket.CAN_RAW_FILTER, struct.pack('=II', 0, mask))
+            channel.setsockopt(socket.SOL_CAN_RAW, socket.CAN_RAW_RECV_OWN_MSGS, 0)
+            channel.bind((name,))
+            channel.setblocking(False)
+            selector.register(channel, selectors.EVENT_READ, name)
+        print('RECEIVE_ONLY: both CAN interfaces, 5 seconds; no motor commands', flush=True)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            for key, _ in selector.select(timeout=min(.2, max(0, deadline - time.monotonic()))):
+                try:
+                    frame = key.fileobj.recv(16)
+                except BlockingIOError:
+                    continue
+                if len(frame) != 16:
+                    continue
+                can_id, length, data = struct.unpack('=IB3x8s', frame)
+                if can_id == 0 and length >= 6:
+                    counters[key.data][data[0] & 15] += 1
+        expected = {1, 2, 4, 5, 6, 7, 8}
+        for name, counts in counters.items():
+            print(json.dumps(dict(interface=name, frames_by_motor_id=dict(counts),
+                                  expected_ids_all_observed=expected <= counts.keys(),
+                                  motor_health_or_motion_certified=False)))
+        print('Counts indicate received feedback-shaped frames, not safe motion or a following test.')
+    finally:
+        selector.close()
+        for channel in sockets:
+            channel.close()
+
+
+if __name__ == '__main__':
+    main()

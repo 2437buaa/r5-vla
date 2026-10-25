@@ -1,0 +1,72 @@
+{
+  "settings": {
+    "schema": "r5-preview-guard-v1",
+    "action_hz": 30,
+    "horizon": 50,
+    "ema_alpha": 0.2,
+    "arm_speed_deg_s": 10.0,
+    "arm_acceleration_deg_s2": 30.0,
+    "gripper_speed_native_s": 0.5,
+    "gripper_acceleration_native_s2": 1.5,
+    "arm_envelope_margin_deg": 3.0,
+    "arm_clip_allowance_deg": 5.0,
+    "gripper_clip_allowance_native": 0.5,
+    "reject_first_arm_jump_deg": 10.0,
+    "reject_adjacent_arm_jump_deg": 8.0,
+    "reject_chunk_arm_excursion_deg": 45.0,
+    "reject_first_gripper_jump_native": 1.0,
+    "reject_adjacent_gripper_jump_native": 1.0,
+    "max_guarded_arm_excursion_deg": 15.0,
+    "max_observation_age_s": 1.0,
+    "max_feedback_age_s": 0.1,
+    "note": "Conservative PREVIEW settings, not manufacturer ratings or certified safety limits. No hardware motion enable switch."
+  },
+  "lower": [
+    1.2166182413366544,
+    -0.05445796105592364,
+    -0.03843623254029864,
+    -1.3453715429040682,
+    -0.6930478200647127,
+    -1.4113667592736971,
+    -0.0919351577758789
+  ],
+  "upper": [
+    2.489416419002701,
+    2.311267195675064,
+    1.7119696721765292,
+    1.3549082860681307,
+    0.800242720577408,
+    1.5414498433801425,
+    5.160220146179199
+  ],
+  "schema": "r5-preview-profile-v1",
+  "kind": "recording_envelope_preview_only",
+  "physical_limits_verified": false,
+  "gripper_endpoints_calibrated": false,
+  "source": {
+    "path": "{{TRAIN_BUNDLE}}/aligned_states.npz",
+    "sha256": "6a959462752b8d9aa678697c0c4e6fff1d5abac57b3ca8742be97aee3138a89e",
+    "episodes": 71,
+    "frames": 24576,
+    "recorded_min": [
+      1.2689781188964844,
+      -0.00209808349609375,
+      0.01392364501953125,
+      -1.2930116653442383,
+      -0.6406879425048828,
+      -1.3590068817138672,
+      -0.0919351577758789
+    ],
+    "recorded_max": [
+      2.437056541442871,
+      2.2589073181152344,
+      1.6596097946166992,
+      1.3025484085083008,
+      0.7478828430175781,
+      1.4890899658203125,
+      5.160220146179199
+    ]
+  },
+  "settings_sha256": "900dc0ad4aa4156dcf38971215da88c2b5c944db033279bd8aea8f5708abce53",
+  "motor_commands_sent": false
+}

@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Isolated interactive ROS shell. Does not activate any robot/camera node.
+set -euo pipefail
+R5_SETUP_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+test -f /opt/ros/humble/setup.bash
+test -f {{ROS_WORKSPACE}}/install/setup.bash
+exec env -u PYTHONPATH -u PYTHONHOME -u LD_LIBRARY_PATH \
+  -u CMAKE_PREFIX_PATH -u AMENT_PREFIX_PATH -u COLCON_PREFIX_PATH \
+  -u CONDA_PREFIX -u CONDA_DEFAULT_ENV -u CONDA_SHLVL \
+  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  LANG=C.UTF-8 LC_ALL=C.UTF-8 PYTHONNOUSERSITE=1 ROS_LOCALHOST_ONLY=1 \
+  /bin/bash --noprofile --rcfile "$R5_SETUP_ROOT/ros_shell.rc" -i

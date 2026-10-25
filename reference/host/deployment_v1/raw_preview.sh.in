@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+R5_RAW_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+exec env -u PYTHONPATH -u PYTHONHOME -u LD_LIBRARY_PATH -u CONDA_PREFIX \
+ -u CONDA_DEFAULT_ENV -u CONDA_SHLVL -u CMAKE_PREFIX_PATH -u AMENT_PREFIX_PATH -u COLCON_PREFIX_PATH \
+ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+ PYTHONNOUSERSITE=1 ROS_DOMAIN_ID=85 ROS_LOCALHOST_ONLY=1 \
+ bash --noprofile --norc -c '
+ source /opt/ros/humble/setup.bash
+ source {{ROS_WORKSPACE}}/install/setup.bash
+ exec /usr/bin/python3 "$1/raw_preview.py" "${@:2}"
+ ' _ "$R5_RAW_DIR" "$@"

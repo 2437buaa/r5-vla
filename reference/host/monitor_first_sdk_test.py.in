@@ -1,0 +1,98 @@
+"""Read-only ROS feedback recorder. Does not import/start the robot SDK."""
+import argparse
+from datetime import datetime, timezone
+import json
+import math
+from pathlib import Path
+import time
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from arx5_arm_msg.msg import RobotStatus
+
+
+def fields(message):
+    values = {key: list(getattr(message, key))
+              for key in ('end_pos', 'joint_pos', 'joint_vel', 'joint_cur')}
+    valid = all(len(value) == (6 if key == 'end_pos' else 7)
+                and all(math.isfinite(x) for x in value)
+                for key, value in values.items())
+    return values, valid
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--seconds', type=float, default=60)
+    parser.add_argument('--topic', default='/arm_status')
+    args = parser.parse_args()
+    if not math.isfinite(args.seconds) or not 1 <= args.seconds <= 600:
+        parser.error('--seconds must be between 1 and 600')
+    folder = Path(__file__).resolve().parent / 'logs' / (
+        'first-sdk-feedback-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ'))
+    folder.mkdir(parents=True, exist_ok=False)
+    rclpy.init()
+    node = Node('r5_first_test_feedback_monitor')
+    total = bad = 0
+    last_received = None
+    previous_position = None
+    max_step = 0.0
+    latest = None
+    start = time.monotonic()
+    print(f'LOG_DIRECTORY={folder}', flush=True)
+    print('MONITOR_ONLY: no SDK startup, no command publisher, no CAN access', flush=True)
+    with (folder / 'feedback.jsonl').open('w') as stream:
+        def callback(message):
+            nonlocal total, bad, last_received, previous_position, max_step, latest
+            values, valid = fields(message)
+            received = time.monotonic()
+            total += 1
+            bad += not valid
+            if valid:
+                if previous_position is not None:
+                    max_step = max(max_step, max(abs(a-b) for a, b in
+                                   zip(values['joint_pos'][:6], previous_position[:6])))
+                previous_position = values['joint_pos']
+                latest = values['joint_pos']
+            record = dict(received_seconds=received-start, valid_numeric_fields=valid,
+                          ros_stamp_sec=message.header.stamp.sec,
+                          ros_stamp_nanosec=message.header.stamp.nanosec, **values)
+            stream.write(json.dumps(record, allow_nan=False) + '\n' if valid else
+                         json.dumps(dict(received_seconds=received-start,
+                                         valid_numeric_fields=False,
+                                         fields_repr=repr(values))) + '\n')
+            last_received = received
+        subscription = node.create_subscription(RobotStatus, args.topic, callback,
+                                                qos_profile_sensor_data)
+        next_print = start
+        try:
+            while rclpy.ok() and time.monotonic()-start < args.seconds:
+                rclpy.spin_once(node, timeout_sec=0.1)
+                now = time.monotonic()
+                if now >= next_print:
+                    age = None if last_received is None else round(now-last_received, 3)
+                    print(json.dumps(dict(messages=total, invalid=bad,
+                                          last_message_age_seconds=age,
+                                          joint_pos=latest)), flush=True)
+                    stream.flush()
+                    next_print = now+1
+        except KeyboardInterrupt:
+            pass
+        finally:
+            summary = dict(status='ROS_FEEDBACK_OBSERVED' if total else 'NO_ROS_FEEDBACK',
+                           messages=total, invalid_messages=bad,
+                           elapsed_seconds=time.monotonic()-start,
+                           max_observed_arm_joint_step_rad=max_step,
+                           sdk_started_by_monitor=False, command_publisher_created=False,
+                           physical_motion_verified=False, raw_can_feedback_freshness_verified=False,
+                           note='ROS publication does not prove fresh motor feedback or safe motion. '
+                                'Stopping this monitor does not stop the robot.')
+            (folder / 'summary.json').write_text(json.dumps(summary, indent=2)+'\n')
+            print(json.dumps(summary, indent=2), flush=True)
+            node.destroy_node()
+            if rclpy.ok():
+                rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

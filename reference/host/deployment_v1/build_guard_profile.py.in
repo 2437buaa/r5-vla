@@ -1,0 +1,39 @@
+"""Build a task recording envelope, explicitly NOT physical joint/gripper limits."""
+import argparse
+from pathlib import Path
+import numpy as np
+from contract import TRAIN, read, write, digest
+from trajectory_guard import validate_profile
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--states', type=Path, default=TRAIN/'aligned_states.npz')
+    parser.add_argument('--output', type=Path, required=True)
+    args = parser.parse_args()
+    if args.output.exists():
+        raise FileExistsError('Preserve the existing profile; select a new output file')
+    settings_path = Path(__file__).with_name('guard_settings.json')
+    settings = read(settings_path)
+    with np.load(args.states, allow_pickle=False) as data:
+        rows = [data[key] for key in sorted(data.files)]
+        if not rows or any(r.ndim != 2 or r.shape[1] != 7 or not len(r) for r in rows):
+            raise ValueError('Expected nonempty seven-dimensional episode states')
+        q = np.concatenate(rows).astype(np.float64)
+    if not np.isfinite(q).all():
+        raise ValueError('Nonfinite recorded state')
+    lower, upper = q.min(axis=0), q.max(axis=0)
+    margin = np.r_[np.full(6, np.deg2rad(settings['arm_envelope_margin_deg'])), 0.0]
+    profile = dict(settings=settings, lower=(lower-margin).tolist(), upper=(upper+margin).tolist(),
+        schema='r5-preview-profile-v1', kind='recording_envelope_preview_only',
+        physical_limits_verified=False, gripper_endpoints_calibrated=False,
+        source=dict(path=str(args.states), sha256=digest(args.states), episodes=len(rows),
+                    frames=len(q), recorded_min=lower.tolist(), recorded_max=upper.tolist()),
+        settings_sha256=digest(settings_path), motor_commands_sent=False)
+    validate_profile(profile)
+    write(args.output, profile)
+    print('PREVIEW_PROFILE_CREATED', args.output, 'episodes=', len(rows), 'frames=', len(q))
+
+
+if __name__ == '__main__':
+    main()

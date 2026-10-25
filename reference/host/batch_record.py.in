@@ -1,0 +1,245 @@
+"""Interactive receive-only episode recorder. Never starts/stops robot SDKs."""
+import argparse
+from datetime import datetime, timezone
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+import yaml
+
+ROOT = Path(__file__).resolve().parent
+LABELS = {'s': 'success', 'f': 'failure', 'd': 'discard', 'u': 'uncertain'}
+
+
+def save(path, value):
+    tmp = path.with_suffix(path.suffix + '.tmp')
+    tmp.write_text(json.dumps(value, indent=2, ensure_ascii=False) + '\n')
+    tmp.replace(path)
+
+
+def topics(include_depth=False):
+    streams = ('color', 'depth') if include_depth else ('color',)
+    return [f'/camera_{c}/{s}/{k}' for c in (1, 2) for s in streams
+            for k in ('image_raw', 'camera_info')] + ['/r5_pair/follower_status', '/tf_static']
+
+
+def check_topics(required):
+    result = subprocess.run(['ros2', 'topic', 'list', '-t'], capture_output=True,
+                            text=True, timeout=15, check=True)
+    present = {line.split()[0] for line in result.stdout.splitlines() if line.startswith('/')}
+    missing = set(required) - present - {'/tf_static'}
+    if missing:
+        raise RuntimeError('Missing required topics: ' + ', '.join(sorted(missing)))
+
+
+def other_recorder_running():
+    for entry in Path('/proc').iterdir():
+        if not entry.name.isdigit() or int(entry.name) == os.getpid():
+            continue
+        try:
+            args = (entry/'cmdline').read_bytes().split(b'\0')
+            if b'bag' in args and b'record' in args and any(b'ros2' in a for a in args):
+                return int(entry.name)
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+    return None
+
+
+def stop_recorder(child):
+    if child.poll() is None:
+        os.killpg(child.pid, signal.SIGINT)
+    try:
+        return child.wait(timeout=20), False
+    except subprocess.TimeoutExpired:
+        os.killpg(child.pid, signal.SIGTERM)
+        try:
+            return child.wait(timeout=5), True
+        except subprocess.TimeoutExpired:
+            os.killpg(child.pid, signal.SIGKILL)
+            return child.wait(timeout=5), True
+
+
+def bag_check(folder, required):
+    path = folder/'raw/bag/metadata.yaml'
+    if not path.exists():
+        return False, {}
+    try:
+        info = yaml.safe_load(path.read_text())['rosbag2_bagfile_information']
+    except (KeyError, TypeError, yaml.YAMLError):
+        return False, {}
+    counts = {r['topic_metadata']['name']: r['message_count']
+              for r in info['topics_with_message_count']}
+    return all(counts.get(t, 0) > 0 for t in required if t != '/tf_static'), counts
+
+
+def record_episode(session, number, args, required):
+    folder = session/'episodes'/f'episode_{number:06d}'
+    (folder/'raw').mkdir(parents=True, exist_ok=False)
+    qos = ROOT/'config/recording_probe_reliable_qos.yaml'
+    shutil.copy2(qos, folder/'raw/qos.yaml')
+    manifest = dict(episode_id=folder.name, task=args.task or 'recording_function_test_only',
+                    test_only=args.test_only, label='unlabeled', training_accepted=False,
+                    exclude_from_training=True, master_recorded=False,
+                    topics=required, include_depth=args.include_depth,
+                    storage='mcap', lossless_compression='zstd_fast',
+                    qos_sha256=hashlib.sha256(qos.read_bytes()).hexdigest(),
+                    ROS_DOMAIN_ID=os.getenv('ROS_DOMAIN_ID'),
+                    wall_start_ns=time.time_ns(), monotonic_start_ns=time.monotonic_ns(),
+                    motor_commands_sent=False, robot_control_changed=False,
+                    state_source='/r5_pair/follower_status',
+                    action_source='future follower states, generated on server',
+                    robot_header_semantics='SDK publication time, not verified motor sample time')
+    save(folder/'episode.json', manifest)
+    command = ['ros2', 'bag', 'record', '-s', 'mcap', '-o', str(folder/'raw/bag'),
+               '--storage-preset-profile', 'zstd_fast', '--max-cache-size', '268435456',
+               '--qos-profile-overrides-path', str(qos), '--node-name', 'r5_batch_recorder'] + required
+    child = None
+    reason = 'unknown'
+    ready = False
+    forced = False
+    code = None
+    try:
+        with (folder/'recorder.log').open('w') as log:
+            child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                     start_new_session=True)
+            deadline = time.monotonic()+args.startup_timeout
+            required_live = set(required)-{'/tf_static'}
+            while not ready:
+                if child.poll() is not None:
+                    raise RuntimeError('Recorder exited during startup; see recorder.log')
+                text = (folder/'recorder.log').read_text(errors='replace')
+                ready = all(f"Subscribed to topic '{topic}'" in text for topic in required_live)
+                if not ready and time.monotonic() > deadline:
+                    raise RuntimeError('Required subscriptions not established within startup timeout')
+                time.sleep(.1)
+            manifest['ready_wall_ns'] = time.time_ns()
+            save(folder/'episode.json', manifest)
+            print('[RECORDING] 已订阅。现在可进行示范；回车结束。停止录制不停止遥操。', flush=True)
+            until = time.monotonic()+args.max_seconds
+            while True:
+                if child.poll() is not None:
+                    reason = 'recorder_exited_early'; break
+                if shutil.disk_usage(session).free < args.reserve_gib*1024**3:
+                    reason = 'disk_reserve_reached'; break
+                if time.monotonic() >= until:
+                    reason = 'time_limit'; break
+                if select.select([sys.stdin], [], [], .1)[0]:
+                    if sys.stdin.readline() == '':
+                        reason = 'input_closed'
+                    else:
+                        reason = 'operator_stop'
+                    break
+    except KeyboardInterrupt:
+        reason = 'interrupted'
+    except Exception as exc:
+        reason = 'startup_error'
+        manifest['error'] = repr(exc)
+    finally:
+        if child is not None:
+            code, forced = stop_recorder(child)
+        valid, counts = bag_check(folder, required)
+        manifest.update(stop_reason=reason, recorder_exit_code=code,
+                        forced_shutdown=forced, wall_end_ns=time.time_ns(),
+                        monotonic_end_ns=time.monotonic_ns(), subscriptions_ready=ready,
+                        bag_structurally_complete=valid, topic_message_counts=counts)
+        save(folder/'episode.json', manifest)
+    print(f'[STOPPED] 录制结束：{reason}；遥操仍独立运行。', flush=True)
+    if ready and valid and code == 0 and not forced and reason in ('operator_stop','time_limit'):
+        try:
+            label = input('[LABEL] s成功 / f失败 / d不要此条但保留文件 / u不确定：').strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            label = 'u'
+        manifest['label'] = LABELS.get(label, 'uncertain')
+    else:
+        manifest['label'] = 'interrupted' if reason == 'interrupted' else 'invalid'
+    manifest['candidate_for_server_validation'] = (
+        valid and code == 0 and not forced and manifest['label'] == 'success')
+    # Success is an operator label, not automatic training acceptance.
+    save(folder/'episode.json', manifest)
+    print(f"[SAVED] {folder.name} label={manifest['label']} reason={reason}", flush=True)
+    return manifest
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--task', help='One natural-language task for this session')
+    parser.add_argument('--test-only', action='store_true', help='No real task; always excluded from training')
+    parser.add_argument('--include-depth', action='store_true')
+    parser.add_argument('--max-seconds', type=float, default=60)
+    parser.add_argument('--episodes', type=int, default=0, help='Total attempted episodes; 0 means until q')
+    parser.add_argument('--min-free-gib', type=float, default=15)
+    parser.add_argument('--reserve-gib', type=float, default=10)
+    parser.add_argument('--startup-timeout', type=float, default=20)
+    parser.add_argument('--output-root', type=Path, default=ROOT/'recordings')
+    parser.add_argument('--check-only', action='store_true')
+    args = parser.parse_args()
+    if not args.test_only and not (args.task and args.task.strip()):
+        parser.error('Supply --task for candidate demonstrations, or --test-only for a functional test')
+    if not 3 <= args.max_seconds <= 600 or args.episodes < 0:
+        parser.error('max-seconds must be 3..600; episodes must be >=0')
+    if args.reserve_gib < 1 or args.min_free_gib < args.reserve_gib+1:
+        parser.error('Require min-free-gib >= reserve-gib+1 and reserve-gib >=1')
+    if os.getenv('ROS_DOMAIN_ID') != '85' and not args.test_only:
+        parser.error('Non-test acquisition must use ROS_DOMAIN_ID=85')
+    required = topics(args.include_depth)
+    check_topics(required)
+    existing = other_recorder_running()
+    if existing:
+        parser.error(f'Another known rosbag recorder is active (pid={existing}); no process stopped')
+    if args.check_only:
+        print('CHECK_ONLY_PASS: required topics visible; no recorder or hardware started')
+        return
+    if not sys.stdin.isatty():
+        parser.error('Interactive terminal required; no recording started')
+    args.output_root.mkdir(parents=True, exist_ok=True)
+    with (args.output_root/'.batch_record.lock').open('a+') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            parser.error('Another batch recorder owns this output root')
+        session = args.output_root/('r5_session_'+datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ'))
+        (session/'episodes').mkdir(parents=True)
+        session_meta = dict(session_id=session.name, task=args.task, test_only=args.test_only,
+                            include_depth=args.include_depth, master_recorded=False,
+                            max_seconds=args.max_seconds, state='open', episodes=[])
+        save(session/'session.json', session_meta)
+        print('SESSION_DIRECTORY='+str(session), flush=True)
+        print('只录相机与从臂；默认不录深度。不会发运动命令。', flush=True)
+        try:
+            while args.episodes == 0 or len(session_meta['episodes']) < args.episodes:
+                if shutil.disk_usage(session).free < args.min_free_gib*1024**3:
+                    print('剩余空间不足，不开始下一条；不会删除文件。', flush=True); break
+                answer = input('[IDLE] 回车开始下一条；q结束本批：').strip().lower()
+                if answer == 'q':
+                    break
+                if answer:
+                    print('请输入回车或q'); continue
+                episode = record_episode(session,len(session_meta['episodes'])+1,args,required)
+                session_meta['episodes'].append(dict(episode_id=episode['episode_id'],label=episode['label'],
+                    candidate_for_server_validation=episode['candidate_for_server_validation']))
+                save(session/'session.json', session_meta)
+                if episode['stop_reason'] in ('interrupted','input_closed','disk_reserve_reached','startup_error'):
+                    break
+        except (KeyboardInterrupt, EOFError):
+            pass
+        finally:
+            session_meta['state'] = 'closed'
+            session_meta['wall_end_ns'] = time.time_ns()
+            save(session/'session.json', session_meta)
+        print('SESSION_CLOSED='+str(session), flush=True)
+        print('录制程序已退出；遥操没有被关闭。', flush=True)
+
+
+if __name__ == '__main__':
+    def terminate(*_):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, terminate)
+    main()

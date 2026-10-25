@@ -1,0 +1,37 @@
+"""Offline tests only; do not access any serial device."""
+import unittest
+from unittest.mock import patch
+import listen_canable as probe
+
+
+class ReceiveTests(unittest.TestCase):
+    def test_exact_firmware_identity(self):
+        self.assertTrue(probe.firmware_supported('16e7497-dirty github.com/normaldotcom/canable2.git\r'))
+        self.assertFalse(probe.firmware_supported('unknown-dirty github.com/normaldotcom/canable2.git\r'))
+        self.assertFalse(probe.firmware_supported('prefix b158aa7 github.com/normaldotcom/canable2.git\r'))
+
+    def test_frame_parser(self):
+        self.assertEqual(probe.frame_id('t0012AABB'), '001')
+        self.assertEqual(probe.frame_id('T000000012AABB'), '00000001')
+        self.assertIsNone(probe.frame_id('t0012AA'))
+        self.assertIsNone(probe.frame_id('b158aa7'))
+        self.assertIsNone(probe.frame_id('V1234'))
+        self.assertIsNone(probe.frame_id('t0019' + '00' * 9))
+
+    def test_only_adapter_commands(self):
+        self.assertEqual(probe.COMMANDS, (b'V\r', b'C\r', b'S8\r', b'M1\r', b'O\r'))
+        self.assertFalse(any(c[:1] in b'tTrRdDbB' for c in probe.COMMANDS))
+
+    def test_busy_port_does_not_open(self):
+        with patch.object(probe.Path, 'exists', return_value=True), \
+             patch.object(probe.subprocess, 'run') as run, \
+             patch.object(probe.os, 'open') as opened:
+            run.return_value.returncode = 0
+            run.return_value.stdout = b'123'
+            with self.assertRaisesRegex(RuntimeError, 'busy'):
+                probe.main()
+            opened.assert_not_called()
+
+
+if __name__ == '__main__':
+    unittest.main(verbosity=2)

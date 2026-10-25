@@ -1,0 +1,192 @@
+"""Offline read-only batch audit. No nodes, publishers, playback or uploads.
+
+Only small reports and sampled contact sheets are written, outside raw sessions.
+Engineering timing thresholds are diagnostics, not hardware synchronization proof.
+"""
+import argparse
+import bisect
+from collections import Counter
+from datetime import datetime, timezone
+import json
+from pathlib import Path
+import time
+
+import cv2
+import numpy as np
+import yaml
+
+RGB = ['/camera_1/color/image_raw', '/camera_2/color/image_raw']
+STATE = '/r5_pair/follower_status'
+
+
+def stats(values):
+    a=np.asarray(values, dtype=np.float64)
+    return dict(count=len(a), minimum=float(a.min()), p50=float(np.median(a)),
+                p95=float(np.percentile(a,95)), maximum=float(a.max())) if len(a) else dict(count=0)
+
+
+def disposition(label, content_ok, warnings):
+    if label == 'discard':
+        return 'excluded_by_operator'
+    if label != 'success':
+        return 'held_' + label
+    return 'candidate_after_visual_review' if content_ok and not warnings else 'needs_review'
+
+
+def pairing(stamps):
+    arrays=[np.asarray(stamps[k],np.int64) for k in RGB+[STATE]]
+    if any(len(a)<2 for a in arrays):return dict(error='Missing required stream')
+    if any(np.any(np.diff(a)<=0) for a in arrays):return dict(error='Non-increasing source stamps')
+    c1,c2,robot=arrays
+    begin=max(a[0] for a in arrays);end=min(a[-1] for a in arrays)
+    anchors=c1[(c1>=begin)&(c1<=end)]
+    offsets=[];brackets=[];good=[];bad_camera=bad_state=reused=0;last_index=-1
+    for t in anchors:
+        i=bisect.bisect_left(c2,t)
+        options=[j for j in (i-1,i) if 0<=j<len(c2)]
+        j=min(options,key=lambda j:abs(int(c2[j])-int(t)))
+        offset=abs(int(c2[j])-int(t))/1e6;offsets.append(offset)
+        camera_ok=offset<=16.7
+        if not camera_ok:bad_camera+=1
+        if camera_ok and j<=last_index:reused+=1;camera_ok=False
+        # Include all nearest mappings: same rule as the strict server checker.
+        last_index=j
+        hi=bisect.bisect_left(robot,t)
+        gap=0. if hi<len(robot) and robot[hi]==t else (
+            float(robot[hi]-robot[hi-1])/1e6 if 0<hi<len(robot) else float('inf'))
+        brackets.append(gap);state_ok=gap<=10
+        if not state_ok:bad_state+=1
+        good.append(camera_ok and state_ok)
+    runs=[];start=None
+    for i,ok in enumerate(good+[False]):
+        if ok and start is None:start=i
+        if not ok and start is not None:runs.append(i-start);start=None
+    return dict(overlap_seconds=float(end-begin)/1e9,anchor_frames=len(anchors),
+                camera_1_boundary_frames_excluded=len(c1)-len(anchors),
+                absolute_camera_offset_ms=stats(offsets),state_bracket_ms=stats(brackets),
+                camera_offset_over_16_7ms=bad_camera,nearest_frame_reuse=reused,
+                state_bracket_over_10ms=bad_state,combined_usable_anchors=sum(good),
+                longest_consecutive_usable_anchors=max(runs,default=0),
+                strict_pairing_pass=bool(len(anchors) and all(good)))
+
+
+def audit_episode(folder, output):
+    import rosbag2_py
+    from rclpy.serialization import deserialize_message
+    from rosidl_runtime_py.utilities import get_message
+
+    meta=json.loads((folder/'episode.json').read_text())
+    bag=folder/'raw/bag'
+    native=yaml.safe_load((bag/'metadata.yaml').read_text())['rosbag2_bagfile_information']
+    expected={r['topic_metadata']['name']:r['message_count'] for r in native['topics_with_message_count']}
+    reader=rosbag2_py.SequentialReader()
+    reader.open(rosbag2_py.StorageOptions(uri=str(bag),storage_id='mcap'),
+                rosbag2_py.ConverterOptions('cdr','cdr'))
+    types={t.name:get_message(t.type) for t in reader.get_all_topics_and_types()}
+    stamps={k:[] for k in types};ages={k:[] for k in types}
+    counts=Counter();invalid=Counter();shapes={k:Counter() for k in RGB}
+    qs=[];images={k:[] for k in RGB};image_stats={k:[] for k in RGB}
+    picks={k:set(round(x*(expected.get(k,0)-1)/4) for x in range(5)) for k in RGB}
+    while reader.has_next():
+        topic,data,received=reader.read_next();m=deserialize_message(data,types[topic])
+        index=counts[topic];counts[topic]+=1
+        if hasattr(m,'header'):
+            t=m.header.stamp.sec*1_000_000_000+m.header.stamp.nanosec
+            stamps[topic].append(t);ages[topic].append((received-t)/1e6)
+            if t<=0:invalid[topic]+=1
+        if topic in RGB:
+            shapes[topic][f'{m.width}x{m.height}/{m.encoding}']+=1
+            if m.encoding!='rgb8' or m.width!=848 or m.height!=530 or m.step<m.width*3 or len(m.data)!=m.step*m.height:
+                invalid[topic]+=1;continue
+            if index in picks[topic]:
+                image=np.frombuffer(m.data,np.uint8).reshape(m.height,m.step)[:,:m.width*3].reshape(m.height,m.width,3)
+                small=cv2.resize(image,(320,200))
+                gray=cv2.cvtColor(small,cv2.COLOR_RGB2GRAY)
+                image_stats[topic].append(dict(index=index,mean=float(gray.mean()),std=float(gray.std()),
+                    near_black_fraction=float((gray<3).mean()),near_white_fraction=float((gray>252).mean())))
+                tile=cv2.cvtColor(small,cv2.COLOR_RGB2BGR)
+                cv2.putText(tile,f'{topic.split("/")[1]} frame {index}',(5,18),cv2.FONT_HERSHEY_SIMPLEX,.45,(0,255,255),1)
+                images[topic].append(tile)
+        elif topic==STATE:
+            q=np.asarray(m.joint_pos,np.float64)
+            if q.shape!=(7,) or not np.isfinite(q).all():invalid[topic]+=1
+            else:qs.append(q)
+        elif topic.endswith('/camera_info'):
+            if m.width!=848 or m.height!=530 or not np.isfinite(m.k).all() or m.k[0]<=0 or m.k[4]<=0:
+                invalid[topic]+=1
+    del reader
+    stream_reports={}
+    for topic in types:
+        a=np.asarray(stamps[topic],np.int64);gaps=np.diff(a)/1e6
+        span=(int(a[-1])-int(a[0]))/1e9 if len(a)>1 else 0
+        r=dict(messages=counts[topic],metadata_messages=expected.get(topic),
+               metadata_count_matches=counts[topic]==expected.get(topic),invalid_messages=invalid[topic],
+               non_increasing_headers=int((gaps<=0).sum()),header_span_seconds=span,
+               rate_hz=(len(a)-1)/span if span else None,header_gap_ms=stats(gaps),
+               receive_minus_header_ms=stats(ages[topic]))
+        if topic in RGB:
+            r.update(image_shapes=dict(shapes[topic]),gaps_over_50ms=int((gaps>50).sum()),
+                estimated_missing_intervals_at_30fps=int(np.maximum(np.rint(gaps/33.333333)-1,0).sum()),
+                sampled_image_stats=image_stats[topic])
+            info=topic.replace('image_raw','camera_info')
+            r['image_headers_without_camera_info']=len(set(stamps[topic])-set(stamps.get(info,[])))
+        if topic==STATE:r['gaps_over_10ms']=int((gaps>10).sum())
+        stream_reports[topic]=r
+    timing=pairing(stamps)
+    q=np.asarray(qs)
+    motion=dict(valid_states=len(q))
+    if len(q)>1:
+        motion.update(joint_min=q.min(axis=0).tolist(),joint_max=q.max(axis=0).tolist(),
+            joint_range=np.ptp(q,axis=0).tolist(),max_adjacent_step=np.abs(np.diff(q,axis=0)).max(axis=0).tolist(),
+            note='Six joint angles in radians, gripper SDK-native units; no leader comparison or motion certification.')
+    canvas=[]
+    for topic in RGB:
+        tiles=images[topic]
+        if tiles:
+            tiles=tiles+[np.zeros_like(tiles[0])]*(5-len(tiles));canvas.append(np.hstack(tiles))
+    if len(canvas)==2:
+        cv2.imwrite(str(output/(folder.name+'_preview.jpg')),np.vstack(canvas),[cv2.IMWRITE_JPEG_QUALITY,85])
+    content_ok=all(r['metadata_count_matches'] and not r['invalid_messages'] and not r['non_increasing_headers'] for r in stream_reports.values())
+    warnings=[]
+    for topic in RGB:
+        r=stream_reports[topic]
+        if r['gaps_over_50ms']:warnings.append(f"{topic}: {r['gaps_over_50ms']} camera gaps >50ms")
+    if stream_reports[STATE]['gaps_over_10ms']:warnings.append('Follower publication has gaps >10ms')
+    if not timing.get('strict_pairing_pass'):warnings.append('Strict full-overlap pairing requires review')
+    return dict(episode=folder.name,label=meta['label'],task=meta['task'],
+        bag_bytes=sum(p.stat().st_size for p in bag.glob('*.mcap')),
+        bag_duration_seconds=native['duration']['nanoseconds']/1e9,
+        recorder_exit_code=meta['recorder_exit_code'],forced_shutdown=meta['forced_shutdown'],
+        content_decode_pass=content_ok,topics=stream_reports,timing=timing,motion=motion,warnings=warnings,
+        disposition=disposition(meta['label'],content_ok,warnings),
+        training_accepted=False)
+
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('session',type=Path);parser.add_argument('--output',type=Path,required=True)
+    args=parser.parse_args();root=args.session.resolve();output=args.output.resolve()
+    meta=json.loads((root/'session.json').read_text())
+    if meta['state']!='closed':parser.error('Closed session required')
+    if output==root or root in output.parents:parser.error('Reports must be outside raw session')
+    output.mkdir(parents=True,exist_ok=False);cv2.setNumThreads(1)
+    rows=[]
+    for entry in meta['episodes']:
+        name=entry['episode_id']
+        if Path(name).name!=name:raise ValueError('Unsafe episode name')
+        begin=time.monotonic()
+        try:r=audit_episode(root/'episodes'/name,output)
+        except Exception as exc:r=dict(episode=name,disposition='read_failed',error=repr(exc),training_accepted=False)
+        rows.append(r);(output/(name+'.json')).write_text(json.dumps(r,indent=2,allow_nan=False)+'\n')
+        print(name,r['disposition'],r.get('timing',{}),f'seconds={time.monotonic()-begin:.1f}',flush=True)
+    report=dict(created_utc=datetime.now(timezone.utc).isoformat(),session=str(root),task=meta['task'],episodes=rows,
+        summary=dict(Counter(r['disposition'] for r in rows)),raw_data_changed=False,uploaded=False,
+        scope='Local offline recording audit only; no training conversion or automatic training acceptance',
+        limitations=['Sparse visual samples do not prove all task successes.',
+            'SDK publication stamps do not certify motor sampling time or hardware exposure synchronization.',
+            '16.7ms camera and 10ms state thresholds are current engineering trial thresholds.'])
+    (output/'audit.json').write_text(json.dumps(report,indent=2,allow_nan=False)+'\n')
+    print('AUDIT_DIRECTORY='+str(output),flush=True)
+
+
+if __name__=='__main__':main()

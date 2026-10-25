@@ -1,0 +1,52 @@
+"""Validate uploaded episodes sequentially on CPU. No robot/ROS runtime."""
+import argparse
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--session',type=Path,required=True)
+    parser.add_argument('--include-test-episodes',action='store_true')
+    args=parser.parse_args()
+    session=args.session.resolve()
+    manifest=json.loads((session/'session.json').read_text())
+    rows=[]
+    tool=Path(__file__).with_name('validate_follower.py')
+    for entry in manifest['episodes']:
+        folder=session/'episodes'/entry['episode_id']
+        if folder.parent != session/'episodes' or not folder.is_dir():
+            raise ValueError('Invalid episode directory')
+        meta=json.loads((folder/'episode.json').read_text())
+        eligible=meta.get('candidate_for_server_validation',False)
+        if meta.get('test_only') and not args.include_test_episodes:
+            eligible=False
+        if not eligible:
+            rows.append(dict(episode_id=folder.name,status='skipped',label=meta.get('label')))
+            continue
+        report=folder/'results/loader_report.json'
+        if report.exists():
+            prior=json.loads(report.read_text())
+            rows.append(dict(episode_id=folder.name,status='existing_report',result=prior['status']))
+            continue
+        if (folder/'results/status.json').exists():
+            rows.append(dict(episode_id=folder.name,status='needs_review',reason='Previous partial results preserved'))
+            continue
+        with (folder/'server_process.log').open('w') as log:
+            rc=subprocess.run([sys.executable,str(tool),'--root',str(folder)],
+                              stdout=log,stderr=subprocess.STDOUT).returncode
+        row=dict(episode_id=folder.name,status='pass' if rc==0 else 'failed',exit_code=rc)
+        rows.append(row)
+        (session/'batch_validation.json').write_text(json.dumps(dict(episodes=rows),indent=2)+'\n')
+    summary=dict(scope='data path validation, not formal training acceptance',
+                 test_only_session=manifest['test_only'],episodes=rows,
+                 passed=sum(r['status']=='pass' for r in rows),
+                 failed=sum(r['status'] in ('failed','needs_review') for r in rows))
+    (session/'batch_validation.json').write_text(json.dumps(summary,indent=2)+'\n')
+    print(json.dumps(summary,indent=2))
+    if summary['failed']:raise SystemExit(2)
+
+
+if __name__=='__main__':main()

@@ -1,0 +1,132 @@
+"""Bounded CANable2 silent receive test. Never transmits a CAN data frame.
+
+Uses only Python standard library. Run with system Python and serial permission.
+Does not create can interfaces, change udev/groups or start robot controllers.
+"""
+import collections
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import select
+import subprocess
+import termios
+import time
+import tty
+
+DEVICE = Path('/dev/serial/by-id/usb-Openlight_Labs_CANable2_b158aa7_github.com_normaldotcom_canable2.git_{{FOLLOWER_CAN_SERIAL}}-if00')
+COMMANDS = (b'V\r', b'C\r', b'S8\r', b'M1\r', b'O\r')
+ALLOWED_REPLIES = {
+    'b158aa7 github.com/normaldotcom/canable2.git',
+    '16e7497-dirty github.com/normaldotcom/canable2.git',
+}
+
+
+def firmware_supported(reply):
+    # Exact observed build identities, not an arbitrary dirty-build wildcard.
+    # Upstream command implementation reviewed; local build changes are unknown.
+    return reply.strip('\r\n') in ALLOWED_REPLIES
+
+
+def frame_id(line):
+    """Accept only correctly sized classic CAN data frames, not status text."""
+    if re.fullmatch(r't[0-9a-fA-F]{3}[0-8][0-9a-fA-F]*', line):
+        return line[1:4].upper() if len(line) == 5 + 2 * int(line[4], 16) else None
+    if re.fullmatch(r'T[0-9a-fA-F]{8}[0-8][0-9a-fA-F]*', line):
+        return line[1:9].upper() if len(line) == 10 + 2 * int(line[9], 16) else None
+    return None
+
+
+def read_for(fd, seconds):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if select.select([fd], [], [], min(0.2, max(0, end - time.monotonic())))[0]:
+            block = os.read(fd, 4096)
+            if not block:
+                raise RuntimeError('Adapter disconnected')
+            yield block
+
+
+def main():
+    if not DEVICE.exists():
+        raise RuntimeError('Expected adapter is absent; do not substitute another serial device')
+    busy = subprocess.run(['/usr/bin/fuser', str(DEVICE.resolve())], capture_output=True)
+    if busy.returncode == 0:
+        raise RuntimeError('Serial port is busy; preserve existing process: ' + busy.stdout.decode())
+    if busy.returncode != 1:
+        raise RuntimeError('Cannot establish that serial port is unused: ' + busy.stderr.decode())
+    fd = os.open(str(DEVICE), os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    old = None
+    exclusive = configured = False
+    sent = []
+    try:
+        fcntl.ioctl(fd, termios.TIOCEXCL)
+        exclusive = True
+        old = termios.tcgetattr(fd)
+        tty.setraw(fd, termios.TCSANOW)
+        attrs = termios.tcgetattr(fd)
+        attrs[4] = attrs[5] = termios.B115200
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+        termios.tcflush(fd, termios.TCIFLUSH)
+
+        def send(command):
+            if command not in COMMANDS:
+                raise RuntimeError('Command is not in the adapter-only allowlist')
+            if os.write(fd, command) != len(command):
+                raise RuntimeError('Incomplete adapter command')
+            termios.tcdrain(fd)
+            sent.append(command.decode().strip())
+            time.sleep(0.1)
+
+        send(b'V\r')
+        version = b''.join(read_for(fd, 1)).decode('ascii', errors='replace')
+        print('FIRMWARE_REPLY:', repr(version), flush=True)
+        if not firmware_supported(version):
+            raise RuntimeError('Firmware does not match reviewed revision; CAN channel not opened')
+        if '-dirty' in version:
+            print('Observed build accepted for bounded receive test; upstream commands reviewed, local build changes unverified', flush=True)
+        configured = True
+        for command in (b'C\r', b'S8\r', b'M1\r', b'O\r'):
+            send(command)
+        print('LISTENING_10_SECONDS: 1Mbps; silent mode requested; no CAN data TX commands', flush=True)
+        counts = collections.Counter()
+        examples = []
+        pending = b''
+        for block in read_for(fd, 10):
+            pending += block
+            while b'\r' in pending:
+                raw, pending = pending.split(b'\r', 1)
+                line = raw.decode('ascii', errors='replace').strip()
+                ident = frame_id(line)
+                if ident is not None:
+                    counts[ident] += 1
+                    if len(examples) < 20:
+                        examples.append(line)
+            if len(pending) > 65536:
+                raise RuntimeError('Unexpected serial data without frame delimiters')
+        print(json.dumps({'status': 'CAN_DATA_OBSERVED' if counts else 'NO_PASSIVE_CAN_DATA',
+                          'received_classic_data_frames': sum(counts.values()),
+                          'counts_by_CAN_ID': dict(counts), 'sample_frames': examples,
+                          'adapter_commands_before_cleanup': sent,
+                          'motor_commands_sent': False,
+                          'silent_mode_acknowledged': False,
+                          'note': 'Firmware provides no command ACK. Frames alone do not prove all joints work; zero frames do not prove a fault.'}, indent=2), flush=True)
+    finally:
+        try:
+            if configured:
+                os.write(fd, b'C\r')
+                termios.tcdrain(fd)
+                print('CAN_CHANNEL_CLOSE_COMMAND_SENT; silent setting retained, not restored to normal mode', flush=True)
+        finally:
+            try:
+                if old is not None:
+                    termios.tcsetattr(fd, termios.TCSANOW, old)
+            finally:
+                if exclusive:
+                    fcntl.ioctl(fd, termios.TIOCNXCL)
+                os.close(fd)
+
+
+if __name__ == '__main__':
+    main()

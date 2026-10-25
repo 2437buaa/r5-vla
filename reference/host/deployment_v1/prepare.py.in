@@ -1,0 +1,86 @@
+"""CPU real-data tests for training/inference equivalence, codecs and R5 action inverse."""
+import os
+from pathlib import Path
+import sys
+import numpy as np
+import cv2
+from contract import TRAIN,SOURCE,NORM_SHA,TASK,digest,read,write,request,unpack_request
+from adapter import transform_and_dataset,prepare,decode
+
+
+def main():
+    assert not os.environ.get('CUDA_VISIBLE_DEVICES')
+    out=Path(sys.argv[1]).resolve()
+    assert not (out/'CPU_READY.json').exists()
+    manifest=read(TRAIN/'data_manifest.json')
+    states=np.load(TRAIN/'aligned_states.npz')
+    offsets=np.cumsum([0]+[len(states[f'episode_{i:03d}']) for i in range(71)])
+    ft,ds=transform_and_dataset()
+    result=[]
+    (out/'samples').mkdir(exist_ok=True)
+    for episode in (0,20,45,50):
+        q=states[f'episode_{episode:03d}']
+        change=int(np.argmax(np.abs(np.diff(q[:,6]))))+1
+        chosen=sorted({0,len(q)//3,2*len(q)//3,max(0,change-10),len(q)-1})
+        for offset in chosen:
+            index=int(offsets[episode]+offset)
+            raw=ds.dataset.hf_dataset[index]
+            cameras={}
+            for i in (1,2):
+                value=raw[f'observation.images.camera_{i}']
+                a=value.permute(1,2,0).numpy()
+                cameras[i]=np.rint(a*255).clip(0,255).astype(np.uint8)
+            state=q[offset]
+            ident=f'ep{episode:03d}_frame{offset:04d}'
+            packet=request(state,cameras[1],cameras[2],ident)
+            restored=unpack_request(packet)
+            assert np.array_equal(state,restored['state'])
+            assert all(np.array_equal(cameras[i],restored[f'camera_{i}']) for i in (1,2))
+            applied=prepare(ft,state,cameras[1],cameras[2])
+            training=ds.getitem(index)
+            import torch
+            differences={}
+            for key in ('state','images','img_masks','lang_tokens','lang_masks','image_grid_thw',
+                        'state_joint_mask','action_joint_mask'):
+                assert torch.equal(applied[key],training[key]),('train/deploy difference',ident,key)
+                differences[key]='exact'
+            expected=q[np.minimum(np.arange(offset+1,offset+51),len(q)-1)]
+            native=decode(ft,applied,training['actions'])
+            assert np.allclose(native,expected,atol=2e-6),ident
+            # Independent full upstream inverse includes the current state at index0.
+            full_inverse=ft.unapply(dict(training))['observation.state'].numpy()
+            assert full_inverse.shape==(51,7)
+            assert np.allclose(native,full_inverse[1:],atol=2e-6)
+            pad=np.arange(offset+1,offset+51)>=len(q)
+            assert np.array_equal(training['action_is_pad'].numpy(),pad)
+            item=out/'samples'/ident;item.mkdir()
+            for i in (1,2):
+                cv2.imwrite(str(item/f'camera_{i}.png'),cv2.cvtColor(cameras[i],cv2.COLOR_RGB2BGR))
+            np.savez(item/'sample.npz',state=state,truth=expected,padding=pad)
+            record=dict(id=ident,episode=episode,offset=int(offset),index=index,
+                valid_future_steps=int((~pad).sum()),train_deploy_inputs=differences,
+                inverse_max_error=float(abs(native-expected).max()),
+                upstream_inverse_shape=[51,7],deployment_actions_shape=[50,7])
+            result.append(record)
+            print('CPU_SAMPLE_PASS',ident,record['valid_future_steps'],flush=True)
+    assert len(result)>=16
+    write(out/'samples.json',result)
+    source_files=[SOURCE/'deploy/lingbot_vla_v2_policy.py',SOURCE/'lingbotvla/data/vla_data/utils.py',
+        SOURCE/'lingbotvla/data/vla_data/transform.py',SOURCE/'lingbotvla/models/vla/lingbot_vla/modeling_lingbot_vla_v2.py',
+        TRAIN/'output/lingbotvla_cli.yaml',TRAIN/'normalization_stats.json',TRAIN/'robot_configs/r5_follower.yaml']
+    for step in (2000,4000):
+        hf=TRAIN/'output/checkpoints'/f'global_step_{step}'/'hf_ckpt'
+        idx=read(hf/'model.safetensors.index.json')
+        source_files.extend([hf/'config.json',hf/'model.safetensors.index.json'])
+        for name in sorted(set(idx['weight_map'].values())):
+            assert (hf/name).stat().st_size>1000000
+            source_files.append(hf/name)
+    write(out/'bindings.json',{str(p):digest(p) for p in source_files})
+    write(out/'CPU_READY.json',dict(status='PASS',samples=len(result),normalization_sha256=NORM_SHA,
+        codec='RGB->256x256INTER_AREA->losslessPNG',train_deploy_inputs_exact=True,
+        padding_boundaries_verified=True,upstream_51_state_inverse_explicitly_handled=True,
+        real_robot_motion_sent=False,gpu_inference_tested=False))
+    print('R5_DEPLOY_CPU_PASS',out,flush=True)
+
+
+if __name__=='__main__':main()

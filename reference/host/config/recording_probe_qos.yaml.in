@@ -1,0 +1,28 @@
+# Recorder subscription QoS only. Does not change publishers or device control.
+/camera_1/color/image_raw: &image_qos
+  history: keep_last
+  depth: 30
+  reliability: best_effort
+  durability: volatile
+/camera_1/depth/image_raw: *image_qos
+/camera_2/color/image_raw: *image_qos
+/camera_2/depth/image_raw: *image_qos
+/camera_1/color/camera_info: &info_qos
+  history: keep_last
+  depth: 10
+  reliability: best_effort
+  durability: volatile
+/camera_1/depth/camera_info: *info_qos
+/camera_2/color/camera_info: *info_qos
+/camera_2/depth/camera_info: *info_qos
+/r5_pair/master_status: &state_qos
+  history: keep_last
+  depth: 1000
+  reliability: reliable
+  durability: volatile
+/r5_pair/follower_status: *state_qos
+/tf_static:
+  history: keep_last
+  depth: 100
+  reliability: reliable
+  durability: transient_local

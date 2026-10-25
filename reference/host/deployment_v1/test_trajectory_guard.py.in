@@ -1,0 +1,145 @@
+"""CPU-only checks: no model, ROS or robot access."""
+import copy
+from pathlib import Path
+import unittest
+import numpy as np
+from contract import read
+from trajectory_guard import GuardRejected, guard_trajectory
+
+
+class GuardTests(unittest.TestCase):
+    def setUp(self):
+        self.profile = dict(schema='r5-preview-profile-v1', kind='recording_envelope_preview_only',
+            physical_limits_verified=False, gripper_endpoints_calibrated=False,
+            lower=[-1.0]*7, upper=[1.0]*7,
+            settings=read(Path(__file__).with_name('guard_settings.json')))
+        self.q = np.zeros(7)
+        self.actions = np.zeros((50, 7))
+
+    def run_guard(self, actions=None, **kwargs):
+        return guard_trajectory(self.actions if actions is None else actions, self.q,
+                                self.profile, observation_age_s=kwargs.pop('observation_age_s', 0), **kwargs)
+
+    def rejected(self, code, actions=None, **kwargs):
+        with self.assertRaises(GuardRejected) as exc:
+            self.run_guard(actions, **kwargs)
+        self.assertEqual(exc.exception.code, code)
+
+    def test_stationary_identity_and_no_enable(self):
+        result = self.run_guard()
+        np.testing.assert_array_equal(result['guarded_actions'], self.actions)
+        self.assertFalse(result['hardware_execution_eligible'])
+        self.assertFalse(result['motor_commands_sent'])
+
+    def test_step_smoothing_speed_acceleration_and_first_step(self):
+        a = np.tile(np.r_[np.full(6, .1), .5], (50, 1))
+        result = self.run_guard(a)
+        q = np.array(result['guarded_actions'])
+        v = np.diff(np.vstack([self.q, q]), axis=0)*30
+        acc = np.diff(np.vstack([np.zeros(7), v]), axis=0)*30
+        self.assertLessEqual(np.rad2deg(abs(v[:, :6])).max(), 10+1e-8)
+        self.assertLessEqual(np.rad2deg(abs(acc[:, :6])).max(), 30+1e-8)
+        self.assertLessEqual(abs(v[:, 6]).max(), .5+1e-8)
+        self.assertLessEqual(abs(acc[:, 6]).max(), 1.5+1e-8)
+        self.assertLessEqual(np.rad2deg(abs(q[0, :6])).max(), 30/30**2+1e-8)
+        self.assertTrue(result['initial_velocity_assumed_zero'])
+
+    def test_soft_target_clipping_keeps_bounds(self):
+        self.profile['lower'] = [-.01]*7
+        self.profile['upper'] = [.01]*7
+        a = np.full((50, 7), .02)
+        result = self.run_guard(a)
+        self.assertLessEqual(np.array(result['guarded_actions']).max(), .01+1e-10)
+        self.assertGreater(result['diagnostics']['clipped_values'], 0)
+
+    def test_braking_before_bound_and_reversal(self):
+        self.profile['lower'] = [-.01]*7
+        self.profile['upper'] = [.01]*7
+        a = np.full((50,7),.02);a[25:]=-.02
+        result=self.run_guard(a)
+        out=np.array(result['guarded_actions'])
+        self.assertTrue((out<=.01+1e-10).all() and (out>=-.01-1e-10).all())
+        self.assertLessEqual(result['diagnostics']['max_arm_acceleration_deg_s2'],30+1e-8)
+        self.assertLess(out[-1,0],out[24,0])
+
+    def test_invalid_shape_and_nan(self):
+        for a in (np.zeros((51, 7)), np.full((50, 7), np.nan), np.full((50, 7), np.inf)):
+            self.rejected('INVALID_ACTIONS', a)
+
+    def test_stale_future_or_nan_age(self):
+        for age in (1.01, -1, np.nan, np.inf):
+            self.rejected('STALE_OR_INVALID_OBSERVATION', observation_age_s=age)
+
+    def test_stale_feedback(self):
+        for age in (.101, -1, np.nan):
+            self.rejected('STALE_OR_INVALID_FEEDBACK', feedback_age_s=age)
+
+    def test_live_reanchor_and_no_command_publishers(self):
+        import ast
+        from synchronization import ObservationBuffer
+        b=ObservationBuffer(); b.add('state',123,np.arange(7),received_ns=1_000_000_000)
+        q,age,stamp=b.feedback_snapshot(now_ns=1_050_000_000)
+        np.testing.assert_array_equal(q,np.arange(7));self.assertEqual(stamp,123)
+        self.assertAlmostEqual(age,.05)
+        with self.assertRaises(ValueError):b.feedback_snapshot(now_ns=1_200_000_000)
+        tree=ast.parse(Path(__file__).with_name('readonly_preview.py').read_text())
+        calls=[n.func.attr for n in ast.walk(tree) if isinstance(n,ast.Call) and isinstance(n.func,ast.Attribute)]
+        self.assertNotIn('create_publisher',calls)
+        imports=[n.name for n in ast.walk(tree) if isinstance(n,ast.alias)]
+        self.assertNotIn('RobotCmd',imports)
+
+    def test_current_outside_not_clipped(self):
+        self.q[1] = 1.001
+        self.rejected('CURRENT_STATE_OUTSIDE_TASK_ENVELOPE')
+
+    def test_first_arm_jump(self):
+        a = self.actions.copy(); a[:, 0] = np.deg2rad(11)
+        self.rejected('FIRST_ARM_TARGET_JUMP', a)
+
+    def test_adjacent_arm_jump(self):
+        a = self.actions.copy(); a[1:, 1] = np.deg2rad(9)
+        self.rejected('ADJACENT_ARM_TARGET_JUMP', a)
+
+    def test_chunk_excursion(self):
+        a = self.actions.copy(); a[:, 0] = np.deg2rad(np.linspace(0, 46, 50))
+        self.rejected('CHUNK_ARM_EXCURSION', a)
+
+    def test_gripper_first_and_adjacent_jump(self):
+        a = self.actions.copy(); a[:, 6] = 1.1
+        self.rejected('FIRST_GRIPPER_TARGET_JUMP', a)
+        a[0, 6] = 0
+        self.rejected('ADJACENT_GRIPPER_TARGET_JUMP', a)
+
+    def test_gross_bounds_not_silently_clipped(self):
+        self.rejected('RAW_TARGET_FAR_OUTSIDE_TASK_ENVELOPE', np.full((50, 7), 50))
+
+    def test_profile_validation(self):
+        for key, value in (('ema_alpha', 0), ('ema_alpha', 1.1), ('arm_speed_deg_s', -1),
+                           ('arm_speed_deg_s', np.nan), ('arm_speed_deg_s', True), ('action_hz', 50)):
+            profile = copy.deepcopy(self.profile); profile['settings'][key] = value
+            with self.assertRaises(GuardRejected):
+                guard_trajectory(self.actions, self.q, profile, observation_age_s=0)
+        self.profile['physical_limits_verified'] = True
+        self.rejected('UNRECOGNIZED_PREVIEW_PROFILE')
+
+    def test_initial_velocity_and_infeasible_boundary(self):
+        self.rejected('INITIAL_SPEED_OUTSIDE_LIMIT', initial_velocity=np.ones(7))
+        self.q[0] = 1.0
+        a = np.tile(self.q, (50, 1))
+        v = np.zeros(7); v[0] = np.deg2rad(10)
+        self.rejected('INFEASIBLE_POSITION_SPEED_ACCELERATION', a, initial_velocity=v)
+
+    def test_inputs_unmodified_and_random_feasible_invariants(self):
+        rng = np.random.default_rng(42)
+        for _ in range(100):
+            a = rng.uniform(-.03, .03, (50, 7))
+            before = a.copy()
+            result = self.run_guard(a)
+            np.testing.assert_array_equal(a, before)
+            output = np.array(result['guarded_actions'])
+            self.assertTrue(np.isfinite(output).all())
+            self.assertLessEqual(abs(output).max(), 1+1e-10)
+
+
+if __name__ == '__main__':
+    unittest.main()

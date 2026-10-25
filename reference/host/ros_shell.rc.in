@@ -1,0 +1,6 @@
+source /opt/ros/humble/setup.bash
+source {{ROS_WORKSPACE}}/install/setup.bash
+PS1='(R5-Humble) \u@\h:\w\$ '
+printf '%s\n' '已进入独立ROS2 Humble环境；未启动机械臂/相机。' \
+  'ROS仅本机通信；退出此子终端使用exit，不影响原Conda环境。' \
+  '普通夹爪尚未适配，请勿直接运行厂家remote_master/remote_slave示例。'

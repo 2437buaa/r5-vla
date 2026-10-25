@@ -1,0 +1,142 @@
+"""Read a CLOSED MCAP bag and export timestamp-paired RGB to side-by-side MP4.
+
+No ROS node/init, replay, SDK, network, or motor commands. Source opened read-only.
+MP4 is a30FPS viewing derivative, not a training/synchronization acceptance.
+"""
+import argparse
+import bisect
+import csv
+import json
+from pathlib import Path
+import subprocess
+
+import cv2
+import numpy as np
+import rosbag2_py
+from rclpy.serialization import deserialize_message
+from sensor_msgs.msg import Image
+
+TOPICS=['/camera_1/color/image_raw','/camera_2/color/image_raw']
+FPS=30
+
+
+def reader(bag):
+    r=rosbag2_py.SequentialReader()
+    r.open(rosbag2_py.StorageOptions(uri=str(bag),storage_id='mcap'),
+           rosbag2_py.ConverterOptions('cdr','cdr'))
+    r.set_filter(rosbag2_py.StorageFilter(topics=TOPICS))
+    return r
+
+
+def nearest(stamps,t):
+    j=bisect.bisect_left(stamps,t)
+    return min((i for i in (j-1,j) if 0<=i<len(stamps)),key=lambda i:abs(stamps[i]-t))
+
+
+def main():
+    p=argparse.ArgumentParser(description=__doc__)
+    p.add_argument('bag',type=Path);p.add_argument('--output',type=Path,required=True)
+    p.add_argument('--allow-timestamp-gaps',action='store_true',
+        help='repeat nearest source frames across header gaps, visibly annotated and reported')
+    a=p.parse_args();bag=a.bag.resolve();out=a.output.resolve()
+    if not (bag/'metadata.yaml').is_file():raise ValueError('Require closed bag metadata')
+    source={str(f):[f.stat().st_size,f.stat().st_mtime_ns] for f in sorted(bag.glob('*.mcap'))}
+    if not source:raise ValueError('No MCAP source')
+    if out.exists():raise FileExistsError('Preserve existing export: '+str(out))
+    out.mkdir(parents=True)
+    stamps={t:[] for t in TOPICS};shape=None;r=reader(bag)
+    while r.has_next():
+        topic,data,_=r.read_next();m=deserialize_message(data,Image)
+        if m.encoding!='rgb8':raise ValueError('Expected rgb8: '+topic)
+        current=(m.height,m.width)
+        if shape is not None and current!=shape:raise ValueError('Camera resolution changed/differs')
+        shape=current;t=m.header.stamp.sec*10**9+m.header.stamp.nanosec
+        if stamps[topic] and t<=stamps[topic][-1]:raise ValueError('Non-increasing image headers')
+        stamps[topic].append(t)
+    del r
+    if any(len(v)<2 for v in stamps.values()):raise ValueError('Missing/short RGB stream')
+    begin=max(v[0] for v in stamps.values());end=min(v[-1] for v in stamps.values())
+    if end<=begin:raise ValueError('No shared camera time range')
+    targets=[begin+round(i*10**9/FPS) for i in range((end-begin)*FPS//10**9+1)]
+    rows=[];selected={t:[] for t in TOPICS}
+    for frame,t in enumerate(targets):
+        ids=[nearest(stamps[topic],t) for topic in TOPICS]
+        times=[stamps[topic][i] for topic,i in zip(TOPICS,ids)]
+        # Do not silently hold a video image across a large missing interval.
+        gap=max(abs(v-t) for v in times)>50_000_000
+        if max(abs(v-t) for v in times)>100_000_000 and not a.allow_timestamp_gaps:
+            raise ValueError('Video source gap >100ms; explicit annotation option required')
+        rows.append(dict(frame=frame,video_seconds=frame/FPS,grid_header_ns=t,
+            camera_1_index=ids[0],camera_2_index=ids[1],camera_1_header_ns=times[0],
+            camera_2_header_ns=times[1],camera_pair_offset_ms=(times[1]-times[0])/1e6,
+            camera_1_grid_offset_ms=(times[0]-t)/1e6,camera_2_grid_offset_ms=(times[1]-t)/1e6,
+            timestamp_gap_annotation=gap))
+        for topic,i in zip(TOPICS,ids):selected[topic].append(i)
+    with (out/'frame_timestamps.csv').open('w',newline='') as f:
+        w=csv.DictWriter(f,fieldnames=list(rows[0]));w.writeheader();w.writerows(rows)
+    h,w=shape;bar=32;width=w*2;height=h+bar
+    partial=out/'dual_view.partial.mp4';final=out/'dual_view.mp4'
+    command=['/usr/bin/ffmpeg','-hide_banner','-loglevel','warning','-n',
+        '-f','rawvideo','-pix_fmt','bgr24','-video_size',f'{width}x{height}',
+        '-framerate',str(FPS),'-i','pipe:0','-an','-c:v','libx264','-preset','fast',
+        '-crf','20','-threads','2','-pix_fmt','yuv420p','-movflags','+faststart',str(partial)]
+    cache={t:{} for t in TOPICS};needed={t:set(v) for t,v in selected.items()}
+    counts={t:0 for t in TOPICS};frame=0
+    previews={0,len(rows)//2,len(rows)-1};tiles=[]
+    print('EXPORT_PLAN',json.dumps(dict(source_frames={t:len(v) for t,v in stamps.items()},
+        output_frames=len(rows),fps=FPS,seconds=len(rows)/FPS,size=[width,height])),flush=True)
+    cv2.setNumThreads(1)
+    with (out/'encoder.log').open('w') as err:
+        child=subprocess.Popen(command,stdin=subprocess.PIPE,stdout=subprocess.DEVNULL,stderr=err)
+        try:
+            r=reader(bag)
+            while r.has_next():
+                topic,data,_=r.read_next();idx=counts[topic];counts[topic]+=1
+                if idx not in needed[topic]:continue
+                m=deserialize_message(data,Image)
+                rgb=np.frombuffer(m.data,np.uint8).reshape(m.height,m.step)[:,:m.width*3].reshape(h,w,3)
+                cache[topic][idx]=cv2.cvtColor(rgb,cv2.COLOR_RGB2BGR)
+                while frame<len(rows) and all(selected[t][frame] in cache[t] for t in TOPICS):
+                    canvas=np.zeros((height,width,3),np.uint8)
+                    for c,t in enumerate(TOPICS):canvas[bar:,c*w:(c+1)*w]=cache[t][selected[t][frame]]
+                    cv2.putText(canvas,'camera_1 - wrist',(12,23),cv2.FONT_HERSHEY_SIMPLEX,.65,(255,255,255),1,cv2.LINE_AA)
+                    cv2.putText(canvas,'camera_2 - external',(w+12,23),cv2.FONT_HERSHEY_SIMPLEX,.65,(255,255,255),1,cv2.LINE_AA)
+                    cv2.putText(canvas,f'{frame/FPS:.2f} s',(width-145,23),cv2.FONT_HERSHEY_SIMPLEX,.6,(255,255,255),1,cv2.LINE_AA)
+                    if rows[frame]['timestamp_gap_annotation']:
+                        cv2.rectangle(canvas,(0,bar),(width,bar+34),(0,0,0),-1)
+                        cv2.putText(canvas,'CAMERA TIMESTAMP GAP - nearest source frame repeated',
+                            (12,bar+25),cv2.FONT_HERSHEY_SIMPLEX,.65,(0,255,255),1,cv2.LINE_AA)
+                    child.stdin.write(canvas.tobytes())
+                    if frame in previews:tiles.append(cv2.resize(canvas,(width//2,height//2)))
+                    for t in TOPICS:
+                        if frame+1==len(rows) or selected[t][frame+1]!=selected[t][frame]:
+                            del cache[t][selected[t][frame]]
+                    frame+=1
+                    if frame%150==0:print('ENCODED',frame,'/',len(rows),flush=True)
+            del r;child.stdin.close()
+            if child.wait(timeout=30)!=0:raise RuntimeError('ffmpeg failed; inspect encoder.log')
+            if frame!=len(rows):raise RuntimeError('Not all paired frames exported')
+        except BaseException:
+            if child.stdin and not child.stdin.closed:child.stdin.close()
+            if child.poll() is None:
+                child.terminate();child.wait(timeout=10)
+            raise
+    unchanged=all([Path(f).stat().st_size,Path(f).stat().st_mtime_ns]==v for f,v in source.items())
+    if not unchanged:raise RuntimeError('Source changed during conversion')
+    partial.rename(final)
+    if tiles:cv2.imwrite(str(out/'preview.jpg'),np.concatenate(tiles,axis=0))
+    report=dict(status='EXPORTED',source_bag=str(bag),source_files=source,source_unchanged=True,
+        video=str(final),source_frames={t:len(v) for t,v in stamps.items()},frames=frame,fps=FPS,
+        duration_seconds=frame/FPS,resolution=[width,height],
+        camera_pair_offset_ms_max=max(abs(r['camera_pair_offset_ms']) for r in rows),
+        source_header_gap_ms_max={t:max(b-a for a,b in zip(v,v[1:]))/1e6 for t,v in stamps.items()},
+        annotated_timestamp_gap_frames=sum(r['timestamp_gap_annotation'] for r in rows),
+        repeated_source_frames={t:len(v)-len(set(v)) for t,v in selected.items()},
+        layout='left camera_1 wrist; right camera_2 external',
+        timeline='30fps common-header grid, nearest source frame; see frame_timestamps.csv',
+        derivative_only=True,hardware_sync_certified=False,motor_commands_sent=False)
+    (out/'export_report.json').write_text(json.dumps(report,indent=2)+'\n')
+    print('EXPORTED',final,flush=True)
+
+
+if __name__=='__main__':main()

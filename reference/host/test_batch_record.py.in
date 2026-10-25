@@ -1,0 +1,64 @@
+"""Unit tests only. No hardware, ROS publishers, or actual recorder launch."""
+import io
+import json
+from pathlib import Path
+import tempfile
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+
+import yaml
+import batch_record as tool
+
+
+class BatchTests(unittest.TestCase):
+    def test_topic_scope(self):
+        self.assertEqual(len(tool.topics()),6)
+        self.assertEqual(len(tool.topics(True)),10)
+        self.assertNotIn('/r5_pair/master_status',tool.topics(True))
+        self.assertFalse(any('/depth/' in x for x in tool.topics()))
+
+    def test_missing_metadata(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(tool.bag_check(Path(d),tool.topics()),(False,{}))
+
+    def test_success_label_is_not_training_acceptance(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d); (root/'episodes').mkdir()
+            args=SimpleNamespace(task='test',test_only=False,include_depth=False,
+                                 startup_timeout=2,max_seconds=3,reserve_gib=1)
+            calls=[]
+            class Child:
+                pid=123456789
+                returncode=None
+                def poll(self):return self.returncode
+                def wait(self,timeout=None):self.returncode=0;return 0
+            def popen(command,**kwargs):
+                self.assertEqual(kwargs['stdin'],tool.subprocess.DEVNULL)
+                self.assertIn('zstd_fast',command)
+                self.assertNotIn('/r5_pair/master_status',command)
+                path=Path(command[command.index('-o')+1]);path.mkdir()
+                data={'rosbag2_bagfile_information':{'topics_with_message_count':[
+                    {'topic_metadata':{'name':name},'message_count':1}
+                    for name in tool.topics() if name!='/tf_static']}}
+                (path/'metadata.yaml').write_text(yaml.safe_dump(data))
+                kwargs['stdout'].write(''.join("Subscribed to topic '%s'\n"%t for t in tool.topics()))
+                kwargs['stdout'].flush()
+                calls.append(command);return Child()
+            with patch.object(tool.subprocess,'Popen',side_effect=popen), \
+                 patch.object(tool.os,'killpg') as kill, \
+                 patch.object(tool.time,'sleep'), \
+                 patch.object(tool.select,'select',return_value=([1],[],[])), \
+                 patch.object(tool.sys,'stdin',io.StringIO('\n')), \
+                 patch('builtins.input',return_value='s'):
+                result=tool.record_episode(root,1,args,tool.topics())
+            self.assertEqual(result['label'],'success')
+            self.assertTrue(result['exclude_from_training'])
+            self.assertFalse(result['training_accepted'])
+            self.assertTrue(result['candidate_for_server_validation'])
+            self.assertFalse(result['motor_commands_sent'])
+            kill.assert_called_once_with(123456789,tool.signal.SIGINT)
+            self.assertEqual(len(calls),1)
+
+
+if __name__=='__main__':unittest.main()

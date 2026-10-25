@@ -1,0 +1,41 @@
+"""Resubmit only the confirmed zero-update failed attempt after IPC passes."""
+import os
+from pathlib import Path
+import subprocess
+import sys
+from common import read,write,sha
+
+b=Path(sys.argv[1]).resolve()
+gate=os.environ['SLURM_JOB_ID']; assert gate.isdecimal()
+assert read(b/'ipc-restart-preflight.json')['status']=='PASS'
+assert read(b/'CPU_READY.json')['training_steps']==4000
+old=read(b/'attempts/job_4429/submission.json'); assert old['jobs']['train']=='4429'
+state=subprocess.check_output(['sacct','-j','4429','-X','-n','-P','--format=State'],text=True).strip()
+assert state.startswith('CANCELLED'),state
+assert not (b/'output').exists(), 'previous attempt output must be archived, not overwritten'
+bound=read(b/'bindings.json')
+changes=[p for p,digest in bound.items() if sha(p)!=digest]
+allowed={str(b/'scripts'/name) for name in ('train.py','train.sbatch','status.sh')}
+assert set(changes)<=allowed,('unexpected training/data source change',changes)
+for p in changes:
+    bound[p]=sha(p)
+for name in ('ipc_preflight.py','restart_after_ipc.py','ipc_restart.sbatch'):
+    p=b/'scripts'/name; bound[str(p)]=sha(p)
+write(b/'bindings.json',bound)
+write(b/'restart_4429_fix.json',dict(old_job='4429',confirmed_updates=0,
+    reason='AF_UNIX path too long in torch multiprocessing FD transfer',
+    changes=changes,short_TMPDIR='{{SERVER_ROOT}}/tmp/r5_${SLURM_JOB_ID}',
+    dataloader_timeout_seconds=180,source_data_and_normalization_unchanged=True))
+fd=os.open(b/'RESTART_4429_SUBMIT_LOCK',os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600);os.close(fd)
+env=dict(os.environ,R5_TRAIN_BUNDLE=str(b))
+job=subprocess.check_output(['sbatch','--parsable','--nice=0',f'--dependency=afterok:{gate}',
+    '--kill-on-invalid-dep=yes',f'--output={b}/logs/train-%j.out',f'--error={b}/logs/train-%j.err',
+    str(b/'scripts/train.sbatch')],text=True,env=env).strip().split(';')[0]
+assert job.isdecimal(),job
+new=dict(old)
+new['jobs']={**old['jobs'],'ipc_gate':gate,'train':job}
+new.update(dependency=f'afterok:{gate}',previous_train_job='4429',
+           restart_reason='fixed overlong Unix socket TMPDIR; previous attempt made zero updates')
+write(b/'submission.json',new)
+print('RESTART_TRAIN_JOB_ID='+job,flush=True)
+subprocess.run(['scontrol','show','job',job,'-o'],check=True)

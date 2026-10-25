@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+#SBATCH --job-name=r5-offline-2k4k
+#SBATCH --partition=gpu
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=6
+#SBATCH --mem=64G
+#SBATCH --time=01:30:00
+#SBATCH --nice=0
+set -euo pipefail
+export PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1
+export OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
+export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
+export PYTHONPATH={{LINGBOT_SOURCE}}
+export TMPDIR="{{SERVER_ROOT}}/tmp/r5d_${SLURM_JOB_ID}"
+mkdir -p "$TMPDIR"
+cd {{LINGBOT_SOURCE}}
+exec {{TRAIN_PYTHON}} -u "$R5_DEPLOY_ROOT/scripts/offline.py" "$R5_DEPLOY_ROOT"

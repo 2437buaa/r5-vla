@@ -1,0 +1,41 @@
+"""Bounded real PyTorch tensor/FD transfer using the job's actual TMPDIR."""
+import multiprocessing as mp
+import multiprocessing.util
+import os
+from pathlib import Path
+import sys
+import torch
+from common import write
+
+
+def send_tensor(queue,received):
+    queue.put(torch.arange(32,dtype=torch.float32))
+    if not received.wait(20):
+        raise RuntimeError('parent did not receive the tensor within20s')
+
+
+def main():
+    temporary=multiprocessing.util.get_temp_dir()
+    assert len(os.fsencode(temporary+'/listener-abcdefgh'))<104,temporary
+    context=mp.get_context('spawn')
+    queue=context.Queue();received=context.Event()
+    process=context.Process(target=send_tensor,args=(queue,received))
+    process.start()
+    try:
+        tensor=queue.get(timeout=20)
+        assert torch.equal(tensor,torch.arange(32,dtype=torch.float32))
+        received.set();process.join(10)
+        assert process.exitcode==0,process.exitcode
+        proof=dict(status='PASS',tensor_file_descriptor_transfer=True,
+                   temporary_directory=temporary,TMPDIR=os.environ.get('TMPDIR'))
+        write(Path(sys.argv[1]),proof)
+        print('TORCH_MULTIPROCESS_IPC_PASS',proof,flush=True)
+    finally:
+        received.set()
+        if process.is_alive():
+            process.terminate();process.join(5)
+        queue.close()
+
+
+if __name__=='__main__':
+    main()

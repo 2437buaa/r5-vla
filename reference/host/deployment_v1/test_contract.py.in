@@ -1,0 +1,72 @@
+"""Interface checks independent of ROS, GPU and physical robots."""
+from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
+import json
+import threading
+import unittest
+import numpy as np
+from contract import request,unpack_request,response_actions,PROTOCOL,NORM_SHA
+from synchronization import ObservationBuffer
+from client import infer,health
+
+
+class ContractTests(unittest.TestCase):
+    def test_rgb_roundtrip_and_roles(self):
+        a=np.zeros((256,256,3),np.uint8);a[:,:,0]=255
+        b=np.zeros_like(a);b[:,:,2]=255
+        packet=request(np.arange(7),a,b,'rgb')
+        restored=unpack_request(packet)
+        np.testing.assert_array_equal(restored['camera_1'],a)
+        np.testing.assert_array_equal(restored['camera_2'],b)
+        with self.assertRaises(ValueError):request([np.nan]*7,a,b,'bad')
+        packet['normalization_sha256']='wrong'
+        with self.assertRaises(ValueError):unpack_request(packet)
+
+    def test_reply_shape_and_request_id(self):
+        value=dict(protocol=PROTOCOL,request_id='1',normalization_sha256=NORM_SHA,
+                   action_hz=30,horizon=50,actions=np.zeros((50,7)).tolist())
+        self.assertEqual(response_actions(value,'1').shape,(50,7))
+        with self.assertRaises(ValueError):response_actions(value,'2')
+        value['actions']=np.zeros((51,7)).tolist()
+        with self.assertRaises(ValueError):response_actions(value,'1')
+
+    def test_alignment_and_staleness(self):
+        buffer=ObservationBuffer();image=np.zeros((256,256,3),np.uint8)
+        for ms in range(0,101):
+            q=np.ones(7,np.float32)*ms;q[6]=0 if ms<99 else 5
+            buffer.add('state',ms*10**6,q,received_ns=10**9)
+        for ms in (20,53,86,119):
+            buffer.add('camera_1',ms*10**6,image,received_ns=10**9)
+            buffer.add('camera_2',(ms+3)*10**6,image,received_ns=10**9)
+        obs=buffer.latest(now_ns=10**9)
+        self.assertEqual(obs['stamps']['camera_1_header_ns'],86*10**6)
+        self.assertEqual(obs['stamps']['camera_offset_ms'],3)
+        self.assertEqual(obs['state'][0],86)
+        self.assertEqual(obs['state'][6],0)
+        with self.assertRaises(ValueError):buffer.latest(now_ns=2*10**9)
+
+    def test_http_roundtrip(self):
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self,*args):pass
+            def do_GET(self):
+                self.send_response(200);self.end_headers()
+                self.wfile.write(json.dumps(dict(status='READY',protocol=PROTOCOL,
+                    normalization_sha256=NORM_SHA)).encode())
+            def do_POST(self):
+                p=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                obs=unpack_request(p)
+                result=dict(protocol=PROTOCOL,request_id=p['request_id'],normalization_sha256=NORM_SHA,
+                    action_hz=30,horizon=50,actions=np.tile(obs['state'],(50,1)).tolist())
+                self.send_response(200);self.end_headers();self.wfile.write(json.dumps(result).encode())
+        server=ThreadingHTTPServer(('127.0.0.1',0),Handler)
+        thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+        try:
+            url=f'http://127.0.0.1:{server.server_port}'
+            self.assertEqual(health(url)['status'],'READY')
+            obs=dict(state=np.arange(7),camera_1=np.zeros((256,256,3),np.uint8),
+                     camera_2=np.ones((256,256,3),np.uint8))
+            actions,_=infer(url,obs,'test',timeout=3)
+            np.testing.assert_array_equal(actions,np.tile(np.arange(7),(50,1)))
+        finally:server.shutdown();server.server_close();thread.join()
+
+
+if __name__=='__main__':unittest.main()

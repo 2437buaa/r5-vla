@@ -1,0 +1,81 @@
+"""Offline reproduction against the EXACT installed vendor motor-parser library.
+
+NO ROS, CAN sockets, motor enable packets, Controller/InterfacesThread objects,
+running-process attachment, or edits to the SDK. Only isolated MotorType1/2
+parser instances receive synthetic feedback in this Python process's memory.
+Object layout was read from this library's DWARF; its SHA is pinned below.
+"""
+import argparse
+import ctypes as C
+import hashlib
+import json
+from pathlib import Path
+import time
+
+SDK=Path('{{ROS_WORKSPACE}}/install/arx_r5_controller/lib/libarx_r5_src.so')
+SHA='30239795532e0d440842405f02092c85f95b5f4b0813c2bdf95b22d89960fa18'
+
+
+class Frame(C.Structure):
+    _fields_=[('can_id',C.c_uint32),('can_dlc',C.c_uint8),('pad',C.c_uint8),
+              ('res0',C.c_uint8),('res1',C.c_uint8),('data',C.c_uint8*8)]
+
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--output',type=Path,required=True)
+    args=parser.parse_args()
+    if args.output.exists():raise FileExistsError('Preserve prior diagnostic results')
+    actual=hashlib.sha256(SDK.read_bytes()).hexdigest()
+    if actual!=SHA or C.sizeof(Frame)!=16:raise RuntimeError('Unreviewed ABI/library')
+    lib=C.CDLL(str(SDK))
+    def bind(name,args,result=None):
+        f=getattr(lib,name);f.argtypes=args;f.restype=result;return f
+    results=[]
+    for typ,motor_id,gap in [(1,2,.25),(1,4,.25),(2,5,.25),(2,5,.85)]:
+        prefix=f'_ZN3arx12hw_interface10MotorType{typ}'
+        ctor=bind(prefix+'C1Ei',[C.c_void_p,C.c_int])
+        destructor=bind(prefix+'D1Ev',[C.c_void_p])
+        analyze=bind(prefix+'10CanAnalyzeEPNS0_8CanFrameE',[C.c_void_p,C.POINTER(Frame)])
+        exchange=bind(prefix+'16ExchangeMotorMsgEv',[C.c_void_p])
+        online=bind(prefix+'6onlineEv',[C.c_void_p],C.c_bool)
+        # 112 bytes, 8-byte aligned, owned by THIS process; not robot memory.
+        storage=(C.c_uint64*14)();obj=C.cast(storage,C.c_void_p)
+        ctor(obj,motor_id)
+        frame=Frame();frame.can_id=0;frame.can_dlc=8
+        frame.data[:]=[0x10+motor_id,0x80,0x00,0x80,0x08,0x00,0,0]
+        def feed():analyze(obj,C.byref(frame));exchange(obj)
+        try:
+            feed();initial=bool(online(obj))
+            time.sleep(gap)
+            after_gap=bool(online(obj))
+            recovery=[]
+            for _ in range(10):
+                feed()
+                age_ms=(time.time_ns()-C.c_int64.from_buffer(storage,48).value)/1e6
+                recovery.append(dict(online=bool(online(obj)),fresh_frame_age_ms=age_ms))
+                time.sleep(.005)
+            # A NEW isolated parser starts online with the same fresh input.
+            other_storage=(C.c_uint64*14)();other=C.cast(other_storage,C.c_void_p)
+            ctor(other,motor_id)
+            try:
+                analyze(other,C.byref(frame));exchange(other)
+                fresh_instance=bool(online(other))
+            finally:destructor(other)
+            expected_latch=gap>(.2 if motor_id<=4 else .8)
+            assert initial and fresh_instance
+            assert after_gap is (not expected_latch)
+            assert all(r['online'] is (not expected_latch) for r in recovery)
+            results.append(dict(motor_type=typ,motor_id=motor_id,gap_s=gap,
+                initial_online=initial,after_gap_online=after_gap,
+                fresh_feedback_recovery=recovery,new_parser_with_fresh_frame_online=fresh_instance))
+        finally:destructor(obj)
+    report=dict(status='OFFLINE_VENDOR_ONLINE_LATCH_REPRODUCED',sdk_path=str(SDK),sdk_sha256=actual,
+        motor_commands_sent=False,CAN_sockets_opened=False,ROS_initialized=False,
+        running_SDK_changed=False,SDK_library_modified=False,cases=results)
+    args.output.parent.mkdir(parents=True,exist_ok=True)
+    args.output.write_text(json.dumps(report,indent=2)+'\n')
+    print(json.dumps(report,indent=2))
+
+
+if __name__=='__main__':main()

@@ -1,0 +1,19 @@
+# Configuration only; uses vendor remote control callbacks without modification.
+# Both devices are ordinary-gripper R5s, hence end_type=0 (not special handle=1).
+# CAUTION: vendor slave callback multiplies master joint_pos[6] by 5. This
+# ordinary-gripper-to-ordinary-gripper mapping is NOT validated on the hardware.
+/r5_pair_master:
+  ros__parameters:
+    arm_can_id: can0
+    arm_control_type: remote_master
+    arm_end_type: 0
+    arm_pub_topic_name: /r5_pair/master_status
+
+/r5_pair_follower:
+  ros__parameters:
+    arm_can_id: can1
+    arm_control_type: remote_slave
+    arm_end_type: 0
+    arm_pub_topic_name: /r5_pair/follower_status
+    arm_sub_topic_name: /r5_pair/master_status
+    catch_control_mode: 0

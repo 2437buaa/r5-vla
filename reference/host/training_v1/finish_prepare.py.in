@@ -1,0 +1,32 @@
+"""Finish reader validation from completed preparation artifacts without decoding twice."""
+import os
+from pathlib import Path
+import sys
+import numpy as np
+import yaml
+from common import SOURCE, STEPS, read, write, sha
+from prepare_checked import reader_checks
+
+b=Path(sys.argv[1]).resolve()
+assert read(b/'preparation_progress.json')['completed_episodes']==71
+m=read(b/'data_manifest.json'); assert m['episode_count']==71
+c=yaml.safe_load((b/'train.yaml').read_text())
+c['train'].update(max_steps=STEPS,save_steps=2000,lr_warmup_ratio=.025)
+for section in c.values():
+    for key,value in list(section.items()):
+        if value is None or value == []:
+            del section[key]
+(b/'train.yaml').write_text(yaml.safe_dump(c,sort_keys=False))
+with np.load(b/'aligned_states.npz') as data:
+    states=[data[f'episode_{i:03d}'].copy() for i in range(71)]
+reader_checks(b,states,m['episodes'])
+files=[b/'train.yaml',b/'train.txt',b/'normalization_stats.json',b/'robot_configs/r5_follower.yaml',
+       b/'data_manifest.json',b/'official_train_snapshot.py',
+       *sorted((b/'dataset').rglob('*.parquet')),
+       *sorted((SOURCE/'lingbotvla').rglob('*.py')),
+       *sorted(p for p in (b/'scripts').iterdir() if p.is_file())]
+write(b/'bindings.json',{str(p):sha(p) for p in files})
+write(b/'CPU_READY.json',dict(status='PASS',episodes=71,frames=sum(len(q) for q in states),
+    nice=0,training_steps=STEPS,normalization_sha256=sha(b/'normalization_stats.json'),
+    comparison_dtype='float32 oracle comparisons; upstream float64 normalizer arithmetic retained'))
+print('R5_TRAIN_CPU_READY',b,flush=True)

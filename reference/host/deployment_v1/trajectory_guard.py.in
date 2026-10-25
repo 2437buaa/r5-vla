@@ -1,0 +1,158 @@
+"""Pure NumPy target filtering. No ROS, SDK, CAN, publishers or motion enable.
+
+Accepted output is for PREVIEW ONLY. It is not collision checking, a stop
+controller, a servo watchdog, or proof of physical joint/gripper safety.
+"""
+import numpy as np
+
+ALGORITHM = 'ema_discrete_braking_envelope_v1'
+
+
+def braking_speed_cap(distance, vmax, amax, dt):
+    """Largest speed whose current step PLUS discrete braking stays in bounds.
+
+    Discrete braking reduces speed by amax*dt on each later tick. Reserving
+    this distance avoids driving to a boundary and only then finding that
+    the position and acceleration constraints are mutually infeasible.
+    """
+    d = np.maximum(distance, 0)
+    # Invert d=dt*(n*v-amax*dt*n*(n-1)/2), where n=ceil(v/(amax*dt)).
+    # The triangular-number form avoids iterative undershoot at each tick.
+    n = np.maximum(1, np.ceil((np.sqrt(1+8*d/(amax*dt**2))-1)/2))
+    cap = (d/dt+amax*dt*n*(n-1)/2)/n
+    return np.where(d == 0, 0.0, np.minimum(vmax, cap))
+
+
+class GuardRejected(ValueError):
+    def __init__(self, code):
+        self.code = code
+        super().__init__(code)
+
+
+def vector(value, name):
+    try:
+        a = np.asarray(value, dtype=np.float64)
+    except (ValueError, TypeError) as exc:
+        raise GuardRejected('INVALID_'+name) from exc
+    if a.shape != (7,) or not np.isfinite(a).all():
+        raise GuardRejected('INVALID_'+name)
+    return a
+
+
+def validate_profile(profile):
+    if (profile.get('schema') != 'r5-preview-profile-v1'
+            or profile.get('kind') != 'recording_envelope_preview_only'
+            or profile.get('physical_limits_verified') is not False
+            or profile.get('gripper_endpoints_calibrated') is not False):
+        raise GuardRejected('UNRECOGNIZED_PREVIEW_PROFILE')
+    lo, hi = vector(profile['lower'], 'LOWER'), vector(profile['upper'], 'UPPER')
+    if np.any(lo >= hi):
+        raise GuardRejected('INVALID_POSITION_INTERVAL')
+    s = profile['settings']
+    if s.get('schema') != 'r5-preview-guard-v1' or s.get('action_hz') != 30 or s.get('horizon') != 50:
+        raise GuardRejected('INVALID_ACTION_CLOCK')
+    names = ('arm_speed_deg_s', 'arm_acceleration_deg_s2', 'gripper_speed_native_s',
+        'gripper_acceleration_native_s2', 'arm_envelope_margin_deg', 'arm_clip_allowance_deg',
+        'gripper_clip_allowance_native', 'reject_first_arm_jump_deg',
+        'reject_adjacent_arm_jump_deg', 'reject_chunk_arm_excursion_deg',
+        'reject_first_gripper_jump_native', 'reject_adjacent_gripper_jump_native',
+        'max_guarded_arm_excursion_deg', 'max_observation_age_s', 'max_feedback_age_s', 'ema_alpha')
+    for key in names:
+        value = s[key]
+        if isinstance(value, bool) or not np.isscalar(value) or not np.isfinite(value) or value <= 0:
+            raise GuardRejected('INVALID_SETTING_'+key)
+    if s['ema_alpha'] > 1:
+        raise GuardRejected('INVALID_EMA_ALPHA')
+    return lo, hi, s
+
+
+def guard_trajectory(actions, current_state, profile, *, observation_age_s,
+                     feedback_age_s=0.0, initial_velocity=None):
+    """Filter 50 absolute targets at nominal 30Hz, anchored at current feedback.
+
+    All-or-nothing: rejection returns no substitute trajectory or automatic
+    retreat. Zero initial velocity is an explicitly logged preview assumption;
+    this routine must NOT be used as a live command scheduler.
+    """
+    lo, hi, s = validate_profile(profile)
+    q = vector(current_state, 'CURRENT_STATE').copy()
+    origin = q.copy()
+    a = np.asarray(actions, dtype=np.float64)
+    if a.shape != (50, 7) or not np.isfinite(a).all():
+        raise GuardRejected('INVALID_ACTIONS')
+    if not np.isfinite(observation_age_s) or not 0 <= observation_age_s <= s['max_observation_age_s']:
+        raise GuardRejected('STALE_OR_INVALID_OBSERVATION')
+    if not np.isfinite(feedback_age_s) or not 0 <= feedback_age_s <= s['max_feedback_age_s']:
+        raise GuardRejected('STALE_OR_INVALID_FEEDBACK')
+    if np.any(q < lo) or np.any(q > hi):
+        raise GuardRejected('CURRENT_STATE_OUTSIDE_TASK_ENVELOPE')
+    allowance = np.r_[np.full(6, np.deg2rad(s['arm_clip_allowance_deg'])),
+                       s['gripper_clip_allowance_native']]
+    if np.any(a < lo-allowance) or np.any(a > hi+allowance):
+        raise GuardRejected('RAW_TARGET_FAR_OUTSIDE_TASK_ENVELOPE')
+    initial_delta = np.abs(a[0]-q)
+    adjacent = np.abs(np.diff(a, axis=0))
+    if np.any(initial_delta[:6] > np.deg2rad(s['reject_first_arm_jump_deg'])):
+        raise GuardRejected('FIRST_ARM_TARGET_JUMP')
+    if np.any(adjacent[:, :6] > np.deg2rad(s['reject_adjacent_arm_jump_deg'])):
+        raise GuardRejected('ADJACENT_ARM_TARGET_JUMP')
+    if np.any(np.abs(a[:, :6]-q[:6]) > np.deg2rad(s['reject_chunk_arm_excursion_deg'])):
+        raise GuardRejected('CHUNK_ARM_EXCURSION')
+    if initial_delta[6] > s['reject_first_gripper_jump_native']:
+        raise GuardRejected('FIRST_GRIPPER_TARGET_JUMP')
+    if np.any(adjacent[:, 6] > s['reject_adjacent_gripper_jump_native']):
+        raise GuardRejected('ADJACENT_GRIPPER_TARGET_JUMP')
+
+    vmax = np.r_[np.full(6, np.deg2rad(s['arm_speed_deg_s'])), s['gripper_speed_native_s']]
+    amax = np.r_[np.full(6, np.deg2rad(s['arm_acceleration_deg_s2'])),
+                 s['gripper_acceleration_native_s2']]
+    v0 = np.zeros(7) if initial_velocity is None else vector(initial_velocity, 'INITIAL_VELOCITY')
+    v = v0.copy()
+    if np.any(np.abs(v) > vmax):
+        raise GuardRejected('INITIAL_SPEED_OUTSIDE_LIMIT')
+    excursion = np.deg2rad(s['max_guarded_arm_excursion_deg'])
+    lo = np.maximum(lo, np.r_[q[:6]-excursion, -np.inf])
+    hi = np.minimum(hi, np.r_[q[:6]+excursion, np.inf])
+    clipped = np.clip(a, lo, hi)
+    ema = q.copy()
+    dt = 1/s['action_hz']
+    result = []
+    for target in clipped:
+        ema += s['ema_alpha']*(target-ema)
+        # Intersect position, velocity and acceleration constraints; do not
+        # clip after acceleration limiting (that could violate acceleration).
+        positive_cap = braking_speed_cap(hi-q, vmax, amax, dt)
+        negative_cap = braking_speed_cap(q-lo, vmax, amax, dt)
+        dq_lo = np.maximum.reduce([lo-q, -negative_cap*dt, (v-amax*dt)*dt])
+        dq_hi = np.minimum.reduce([hi-q, positive_cap*dt, (v+amax*dt)*dt])
+        if np.any(dq_lo > dq_hi + 1e-12):
+            raise GuardRejected('INFEASIBLE_POSITION_SPEED_ACCELERATION')
+        # Coalesce only <=1e-12 position roundoff; final position/rate/accel
+        # checks still run. Larger conflicts reject the complete proposal.
+        midpoint=(dq_lo+dq_hi)/2
+        rounding=dq_lo>dq_hi
+        dq_lo=np.where(rounding,midpoint,dq_lo)
+        dq_hi=np.where(rounding,midpoint,dq_hi)
+        dq = np.clip(ema-q, dq_lo, dq_hi)
+        q = q+dq
+        v = dq/dt
+        result.append(q.copy())
+    result = np.asarray(result)
+    velocities = np.diff(np.vstack([origin, result]), axis=0)/dt
+    accelerations = np.diff(np.vstack([v0, velocities]), axis=0)/dt
+    if (not np.isfinite(result).all() or np.any(result < lo-1e-10)
+            or np.any(result > hi+1e-10) or np.any(np.abs(velocities) > vmax+1e-9)
+            or np.any(np.abs(accelerations) > amax+1e-8)):
+        raise GuardRejected('POSTCONDITION_FAILED')
+    return dict(status='PREVIEW_FILTERED', algorithm=ALGORITHM, hardware_execution_eligible=False,
+        motor_commands_sent=False, guarded_actions=result.tolist(),
+        initial_velocity_assumed_zero=initial_velocity is None,
+        diagnostics=dict(clipped_values=int(np.count_nonzero(a != clipped)),
+            modified_values=int(np.count_nonzero(np.abs(a-result) > 1e-8)),
+            max_arm_speed_deg_s=float(np.rad2deg(np.abs(velocities[:, :6]).max())),
+            max_arm_acceleration_deg_s2=float(np.rad2deg(np.abs(accelerations[:, :6]).max())),
+            max_gripper_speed_native_s=float(np.abs(velocities[:, 6]).max()),
+            max_gripper_acceleration_native_s2=float(np.abs(accelerations[:, 6]).max()),
+            max_modification_arm_deg=float(np.rad2deg(np.abs(a[:, :6]-result[:, :6]).max())),
+            first_guarded_delta_rad=(result[0, :6]-origin[:6]).tolist(),
+            observation_age_s=float(observation_age_s), feedback_age_s=float(feedback_age_s)))

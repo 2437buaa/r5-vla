@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+R5_DEPLOY_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+export R5_DEPLOY_ROOT
+python3 - <<'PY'
+import json,os,subprocess
+from pathlib import Path
+b=Path(os.environ['R5_DEPLOY_ROOT']);print('DEPLOY_ROOT=',b)
+if (b/'submission.json').exists():
+ s=json.loads((b/'submission.json').read_text());print(s)
+ subprocess.run(['sacct','-j',','.join(s['jobs'].values()),'-X','--format=JobID,JobName,State,ExitCode,Elapsed'])
+for name in ('CPU_READY.json','progress.json','OFFLINE_COMPLETE.json'):
+ p=b/name
+ if p.exists():print(name,json.loads(p.read_text()))
+for step in (2000,4000):
+ p=b/f'offline_{step}.json'
+ if p.exists():
+  m=json.loads(p.read_text());m.pop('rows',None);print(p.name,m)
+PY

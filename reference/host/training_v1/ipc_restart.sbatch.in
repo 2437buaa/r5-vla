@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+#SBATCH --job-name=r5-ipc-restart-gate
+#SBATCH --partition=gpu
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=3G
+#SBATCH --time=00:10:00
+#SBATCH --nice=0
+set -euo pipefail
+export CUDA_VISIBLE_DEVICES=''
+export PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
+export TMPDIR="{{SERVER_ROOT}}/tmp/r5_${SLURM_JOB_ID}"
+mkdir -p "$TMPDIR"
+{{TRAIN_PYTHON}} -u \
+ "$R5_TRAIN_BUNDLE/scripts/ipc_preflight.py" "$R5_TRAIN_BUNDLE/ipc-restart-preflight.json"
+{{TRAIN_PYTHON}} -u \
+ "$R5_TRAIN_BUNDLE/scripts/restart_after_ipc.py" "$R5_TRAIN_BUNDLE"

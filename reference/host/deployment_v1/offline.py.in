@@ -1,0 +1,86 @@
+"""Slurm GPU inference on recorded observations only, sequential2000/4000 comparison."""
+import gc
+from pathlib import Path
+import sys
+import time
+import numpy as np
+import cv2
+from contract import TRAIN,NORM_SHA,read,write,digest
+from adapter import R5Policy
+
+
+def samples(root):
+    for item in read(root/'samples.json'):
+        folder=root/'samples'/item['id']
+        with np.load(folder/'sample.npz') as values:
+            data={key:values[key].copy() for key in values.files}
+        for i in (1,2):
+            data[f'camera_{i}']=cv2.cvtColor(cv2.imread(str(folder/f'camera_{i}.png')),cv2.COLOR_BGR2RGB)
+        yield item,data
+
+
+def main():
+    import torch
+    root=Path(sys.argv[1]).resolve()
+    assert read(root/'CPU_READY.json')['status']=='PASS'
+    for p,h in read(root/'bindings.json').items():assert digest(p)==h,('changed bound input',p)
+    assert torch.cuda.device_count()==1
+    reports=[]
+    for step in (2000,4000):
+        started=time.perf_counter();policy=R5Policy(step)
+        load_seconds=time.perf_counter()-started
+        write(root/f'load_{step}.json',{**policy.load_evidence,'load_seconds':load_seconds})
+        first=next(samples(root))[1]
+        for warmup in range(2):
+            policy.infer(first['state'],first['camera_1'],first['camera_2'],seed=1234+warmup)
+        rows=[];abs_errors=[];native_predictions=[]
+        for item,data in samples(root):
+            a,timing,normalized=policy.infer(data['state'],data['camera_1'],data['camera_2'],seed=42)
+            folder=root/'inference'/str(step);folder.mkdir(parents=True,exist_ok=True)
+            np.savez(folder/(item['id']+'.npz'),actions=a,normalized=normalized,
+                truth=data['truth'],padding=data['padding'])
+            valid=~data['padding']
+            error=abs(a[valid]-data['truth'][valid])
+            if len(error):abs_errors.append(error)
+            native_predictions.append(a)
+            row=dict(id=item['id'],**timing,valid_future=int(valid.sum()),
+                arm_mae_rad=float(error[:,:6].mean()) if len(error) else None,
+                gripper_mae_native=float(error[:,6].mean()) if len(error) else None,
+                first_target_delta_rad=(a[0,:6]-data['state'][:6]).tolist(),
+                within_50step_execution_budget=timing['total_ms']<50/30*1000)
+            rows.append(row)
+            print('INFERENCE_PASS',step,item['id'],timing['total_ms'],flush=True)
+            write(root/'progress.json',dict(step=step,completed=len(rows),planned=len(read(root/'samples.json'))))
+        error=np.concatenate(abs_errors)
+        predicted=np.concatenate(native_predictions)
+        times=np.array([r['total_ms'] for r in rows])
+        report=dict(step=step,status='PASS',strict_load=policy.load_evidence,
+            samples=len(rows),load_seconds=load_seconds,
+            total_ms_median=float(np.median(times)),total_ms_p95=float(np.percentile(times,95)),
+            model_ms_median=float(np.median([r['model_ms'] for r in rows])),
+            effective_30hz_execution_chunk_min_steps=int(np.ceil(np.percentile(times,95)*30/1000)),
+            arm_mae_rad=error[:,:6].mean(axis=0).tolist(),
+            arm_mae_deg=np.rad2deg(error[:,:6].mean(axis=0)).tolist(),
+            gripper_mae_native=float(error[:,6].mean()),
+            predicted_native_min=predicted.min(axis=0).tolist(),predicted_native_max=predicted.max(axis=0).tolist(),
+            cuda_peak_GiB=torch.cuda.max_memory_allocated()/1024**3,
+            scope='recorded TRAINING observations, open-loop comparison, NOT held-out success rate',rows=rows)
+        write(root/f'offline_{step}.json',report);reports.append(report)
+        del policy;gc.collect();torch.cuda.empty_cache();torch.cuda.reset_peak_memory_stats()
+    write(root/'OFFLINE_COMPLETE.json',dict(status='PASS',steps=[2000,4000],
+        normalization_sha256=NORM_SHA,real_robot_motion_sent=False,
+        real_robot_success_rate_measured=False))
+    lines=['# R5双检查点离线推理','',
+           '仅使用训练录制画面；不是独立验证集，不代表闭环成功率。','',
+           '|模型步数|总延迟中位数ms|P95ms|六轴平均MAE度|夹爪MAE原生值|',
+           '|---|---:|---:|---:|---:|']
+    for report in reports:
+        lines.append(f"|{report['step']}|{report['total_ms_median']:.1f}|{report['total_ms_p95']:.1f}|{np.mean(report['arm_mae_deg']):.3f}|{report['gripper_mae_native']:.4f}|")
+    lines+=['','误差统计排除尾部padding；夹爪数值不当作米制宽度。',
+            '推理周期需实测；30Hz是逐动作执行频率，不能据此假定每33ms能完成一次模型推理。',
+            '此检查未启动任何机器人、相机或运动发布器。']
+    (root/'REPORT_zh.md').write_text('\n'.join(lines)+'\n')
+    print('R5_OFFLINE_COMPARISON_COMPLETE',root,flush=True)
+
+
+if __name__=='__main__':main()

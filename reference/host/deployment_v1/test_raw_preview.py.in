@@ -1,0 +1,22 @@
+"""Pure summary checks. No ROS, model connection or robot."""
+import unittest
+import numpy as np
+from raw_preview import describe
+
+
+class RawTests(unittest.TestCase):
+    def test_actions_are_never_changed(self):
+        a=np.arange(350,dtype=np.float32).reshape(50,7)/100
+        before=a.copy();r=describe(a,np.zeros(7,np.float32))
+        np.testing.assert_array_equal(a,before)
+        self.assertFalse(r['actions_modified'])
+        self.assertFalse(r['motor_commands_sent'])
+        self.assertAlmostEqual(r['gripper_first_target_native'],float(a[0,6]))
+        self.assertAlmostEqual(r['max_chunk_excursion_deg'][0],float(np.rad2deg(a[-1,0])),places=4)
+
+    def test_invalid_outputs_rejected(self):
+        for a in [np.zeros((51,7)),np.full((50,7),np.nan)]:
+            with self.assertRaises(ValueError):describe(a,np.zeros(7))
+
+
+if __name__=='__main__':unittest.main()

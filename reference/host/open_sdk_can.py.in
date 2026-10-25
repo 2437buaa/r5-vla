@@ -1,0 +1,87 @@
+"""Keep the selected CAN interface available for the original R5 SDK.
+
+No controller is started. Startup requires all R5Controller processes stopped.
+"""
+import argparse
+import os
+from pathlib import Path
+import signal
+import socket
+import subprocess
+import time
+from socketcan_receive import configure
+from listen_canable import DEVICE
+
+MASTER_DEVICE = Path('/dev/serial/by-id/usb-Openlight_Labs_CANable2_b158aa7_github.com_normaldotcom_canable2.git_{{MASTER_CAN_SERIAL}}-if00')
+
+
+def arm_device(arm):
+    if arm == 'follower':
+        return DEVICE, 'can1'
+    if arm == 'master':
+        return MASTER_DEVICE, 'can0'
+    raise ValueError('Unknown arm role')
+
+
+def sdk_running():
+    result = subprocess.run(['/usr/bin/pgrep', '-x', 'R5Controller'], capture_output=True)
+    if result.returncode not in (0, 1):
+        raise RuntimeError('Cannot check whether SDK is still running')
+    return result.returncode == 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--arm', choices=('follower', 'master'), default='follower')
+    args = parser.parse_args()
+    device, interface = arm_device(args.arm)
+    if os.geteuid() != 0:
+        raise RuntimeError('Run with sudo and /usr/bin/python3')
+    if not device.exists() or Path('/sys/class/net', interface).exists() or sdk_running():
+        raise RuntimeError(f'Adapter absent, {interface} exists, or SDK already running; no existing process changed')
+    subprocess.run(['/usr/sbin/modprobe', 'slcan'], check=True)
+    print(f'ARM={args.arm} DEVICE={device} INTERFACE={interface}', flush=True)
+    configure(normal_receive=True, device=device)
+    child = subprocess.Popen(['/usr/bin/slcand', '-F', '-o', '-c', '-s8', '-S115200',
+                              str(device.resolve()), interface], start_new_session=True)
+    stop_requested = False
+    index = None
+    def stop(*_):
+        nonlocal stop_requested
+        stop_requested = True
+    old_int = signal.signal(signal.SIGINT, stop)
+    old_term = signal.signal(signal.SIGTERM, stop)
+    try:
+        deadline = time.monotonic()+5
+        while not Path('/sys/class/net', interface).exists():
+            if child.poll() is not None or time.monotonic() > deadline:
+                raise RuntimeError(f'slcand failed to create {interface}')
+            time.sleep(0.1)
+        index = socket.if_nametoindex(interface)
+        subprocess.run(['/usr/sbin/ip', 'link', 'set', 'dev', interface, 'up'], check=True)
+        print(f'{interface.upper()}_READY: M0 normal requested, S8 1Mbps requested; no motor command sent', flush=True)
+        print('Keep this terminal open. Normal shutdown: stop SDK first, then Ctrl+C here.', flush=True)
+        last_notice = 0
+        while child.poll() is None:
+            if stop_requested:
+                if not sdk_running():
+                    break
+                if time.monotonic()-last_notice > 3:
+                    print('SDK_STILL_RUNNING: preserving CAN; stop SDK in its terminal first.', flush=True)
+                    last_notice = time.monotonic()
+            time.sleep(0.2)
+        if child.poll() is not None:
+            raise RuntimeError('CAN process exited unexpectedly; this is not a robot stop guarantee')
+    finally:
+        if child.poll() is None:
+            if index is not None and Path('/sys/class/net', interface).exists() and socket.if_nametoindex(interface) == index:
+                subprocess.run(['/usr/sbin/ip', 'link', 'set', 'dev', interface, 'down'], check=False)
+            child.terminate()
+            child.wait(timeout=5)
+        signal.signal(signal.SIGINT, old_int)
+        signal.signal(signal.SIGTERM, old_term)
+        print('CAN_SESSION_CLOSED', flush=True)
+
+
+if __name__ == '__main__':
+    main()

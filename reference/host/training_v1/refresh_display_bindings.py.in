@@ -1,0 +1,16 @@
+"""Rebind only the two updated display/doc files, preserving all training input hashes."""
+from pathlib import Path
+import shutil
+import sys
+from common import read,write,sha
+b=Path(sys.argv[1]).resolve()
+bound=read(b/'bindings.json')
+changed=[p for p,digest in bound.items() if sha(p)!=digest]
+allowed={str(b/'scripts/README.md'),str(b/'scripts/status.sh')}
+assert set(changed)<=allowed,('training input unexpectedly changed',changed)
+shutil.copy2(b/'bindings.json',b/'bindings_before_display_update.json')
+write(b/'display_binding_update.json',dict(changed=changed,training_inputs_unchanged=True))
+for p in changed:
+    bound[p]=sha(p)
+write(b/'bindings.json',bound)
+print('ALL_TRAINING_BINDINGS_VERIFIED; display-only updates:',changed)

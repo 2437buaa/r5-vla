@@ -1,0 +1,121 @@
+"""Temporary SocketCAN receive test. No robot SDK or CAN data transmit calls.
+
+--normal-receive requests normal controller mode, including hardware CAN ACKs.
+"""
+import argparse
+import collections
+import fcntl
+import json
+import os
+from pathlib import Path
+import signal
+import socket
+import struct
+import subprocess
+import termios
+import time
+import tty
+
+from listen_canable import DEVICE, firmware_supported, read_for
+
+IFACE = 'r5listen'
+
+
+def configure(normal_receive=False, device=DEVICE):
+    busy = subprocess.run(['/usr/bin/fuser', str(device.resolve())], capture_output=True)
+    if busy.returncode != 1:
+        raise RuntimeError('Adapter busy or ownership check failed; no process stopped')
+    fd = os.open(str(device), os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    old = termios.tcgetattr(fd)
+    exclusive = False
+    try:
+        fcntl.ioctl(fd, termios.TIOCEXCL)
+        exclusive = True
+        tty.setraw(fd)
+        attrs = termios.tcgetattr(fd)
+        attrs[4] = attrs[5] = termios.B115200
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+        termios.tcflush(fd, termios.TCIFLUSH)
+        def command(data):
+            assert data in (b'V\r', b'C\r', b'S8\r', b'M1\r', b'M0\r')
+            if os.write(fd, data) != len(data):
+                raise RuntimeError('Short serial write')
+            termios.tcdrain(fd)
+            time.sleep(0.1)
+        command(b'V\r')
+        version = b''.join(read_for(fd, 1)).decode('ascii', errors='replace')
+        print('FIRMWARE_REPLY', repr(version), flush=True)
+        if not firmware_supported(version):
+            raise RuntimeError('Unknown firmware; stopped before CAN configuration')
+        mode = b'M0\r' if normal_receive else b'M1\r'
+        for data in (b'C\r', b'S8\r', mode):
+            command(data)
+    finally:
+        termios.tcsetattr(fd, termios.TCSANOW, old)
+        if exclusive:
+            fcntl.ioctl(fd, termios.TIOCNXCL)
+        os.close(fd)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--normal-receive', action='store_true',
+                        help='Enable controller ACKs; application still receives only')
+    args = parser.parse_args()
+    if os.geteuid() != 0:
+        raise RuntimeError('Run with sudo and system Python')
+    if not DEVICE.exists() or Path('/sys/class/net', IFACE).exists():
+        raise RuntimeError('Expected adapter absent or test interface already exists')
+    subprocess.run(['/usr/sbin/modprobe', 'slcan'], check=True)
+    configure(args.normal_receive)
+    # Use resolved short path: slcand has a 256-byte ttypath buffer.
+    child = subprocess.Popen(['/usr/bin/slcand', '-F', '-o', '-c', '-s8', '-S115200',
+                              str(DEVICE.resolve()), IFACE], start_new_session=True)
+    index = None
+    try:
+        deadline = time.monotonic() + 5
+        while not Path('/sys/class/net', IFACE).exists():
+            if child.poll() is not None or time.monotonic() > deadline:
+                raise RuntimeError('SocketCAN interface creation failed')
+            time.sleep(0.1)
+        index = socket.if_nametoindex(IFACE)
+        subprocess.run(['/usr/sbin/ip', 'link', 'set', 'dev', IFACE, 'up'], check=True)
+        subprocess.run(['/usr/sbin/ip', '-details', '-statistics', 'link', 'show', IFACE], check=True)
+        counts = collections.Counter()
+        with socket.socket(socket.PF_CAN, socket.SOCK_RAW, socket.CAN_RAW) as receiver:
+            receiver.bind((IFACE,))
+            receiver.settimeout(0.25)
+            end = time.monotonic() + 10
+            mode = 'M0 normal (hardware ACK enabled)' if args.normal_receive else 'M1 silent'
+            print(f'SOCKETCAN_UP; receiving 10 seconds; {mode} requested; no motor commands', flush=True)
+            while time.monotonic() < end:
+                if child.poll() is not None:
+                    raise RuntimeError('slcand exited during receive')
+                try:
+                    frame = receiver.recv(16)
+                except socket.timeout:
+                    continue
+                if len(frame) == 16:
+                    ident, length, payload = struct.unpack('=IB3x8s', frame)
+                    counts[hex(ident)] += 1
+        print(json.dumps({'status': 'SOCKETCAN_RECEIVE_COMPLETE', 'frames': sum(counts.values()),
+                          'counts_by_id': dict(counts), 'motor_commands_sent': False,
+                          'silent_mode_requested': not args.normal_receive,
+                          'normal_mode_requested': args.normal_receive,
+                          'hardware_mode_verified': False}, indent=2), flush=True)
+    finally:
+        if child.poll() is None:
+            if index is not None and Path('/sys/class/net', IFACE).exists() and socket.if_nametoindex(IFACE) == index:
+                subprocess.run(['/usr/sbin/ip', 'link', 'set', 'dev', IFACE, 'down'], check=False)
+            child.terminate()
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                print('Cleanup: owned slcand did not exit; PID', child.pid, flush=True)
+                raise
+        print('TEST_FINISHED; temporary interface cleanup requested; requested hardware mode retained', flush=True)
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+    main()

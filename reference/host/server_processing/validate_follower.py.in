@@ -1,0 +1,291 @@
+"""CPU-only server validation of RGB + follower trajectory; no ROS runtime.
+
+Source robot messages are never replayed. Master data is never decoded/used.
+Derived test episodes are explicitly excluded from training.
+"""
+import argparse
+import bisect
+import csv
+import hashlib
+import importlib
+import importlib.metadata
+import json
+import os
+from pathlib import Path
+import sys
+import traceback
+import types
+
+import cv2
+import numpy as np
+import yaml
+
+CAMERAS = [f"/camera_{i}/color/image_raw" for i in (1, 2)]
+FOLLOWER = "/r5_pair/follower_status"
+SOURCE = Path('{{LINGBOT_SOURCE}}')
+
+
+def dump(path, obj):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + '.tmp')
+    temp.write_text(json.dumps(obj, indent=2, allow_nan=False) + '\n')
+    temp.replace(path)
+
+
+def iter_messages(file):
+    from mcap.reader import make_reader
+    from mcap_ros2.decoder import DecoderFactory
+    with file.open('rb') as stream:
+        reader = make_reader(stream, decoder_factories=[DecoderFactory()])
+        for _, channel, message, decoded in reader.iter_decoded_messages(
+                topics=CAMERAS + [FOLLOWER], log_time_order=True):
+            stamp = decoded.header.stamp.sec*1_000_000_000 + decoded.header.stamp.nanosec
+            yield channel.topic, stamp, message.log_time, decoded
+
+
+def nearest(stamps, target):
+    index = bisect.bisect_left(stamps, target)
+    options = [j for j in (index-1, index) if 0 <= j < len(stamps)]
+    return min(options, key=lambda j: abs(stamps[j]-target))
+
+
+def align(root):
+    bag = root / 'raw/bag/bag_0.mcap'
+    stamps = {k: [] for k in CAMERAS + [FOLLOWER]}
+    q = []
+    ages = {k: [] for k in stamps}
+    for topic, stamp, receive, message in iter_messages(bag):
+        if stamps[topic] and stamp <= stamps[topic][-1]:
+            raise ValueError('Non-increasing source timestamp: ' + topic)
+        stamps[topic].append(stamp)
+        ages[topic].append((receive-stamp)/1e6)
+        if topic == FOLLOWER:
+            q.append(list(message.joint_pos))
+    if any(len(v) < 2 for v in stamps.values()):
+        raise ValueError('Missing camera or follower data')
+    q = np.asarray(q, np.float64)
+    assert q.shape[1] == 7 and np.isfinite(q).all()
+    begin = max(v[0] for v in stamps.values())
+    end = min(v[-1] for v in stamps.values())
+    # Anchor observations to real camera_1 header times, not receive order.
+    anchors = [(i, t) for i, t in enumerate(stamps[CAMERAS[0]]) if begin <= t <= end]
+    selected = {k: [] for k in CAMERAS}
+    state = []
+    rows = []
+    for frame, (idx1, target) in enumerate(anchors):
+        idx2 = nearest(stamps[CAMERAS[1]], target)
+        delta = stamps[CAMERAS[1]][idx2]-target
+        if abs(delta) > 16_700_000:
+            raise ValueError('Cross-camera offset exceeds 16.7ms trial tolerance')
+        if selected[CAMERAS[1]] and idx2 <= selected[CAMERAS[1]][-1]:
+            raise ValueError('Frame reuse/reordering is not allowed')
+        selected[CAMERAS[0]].append(idx1)
+        selected[CAMERAS[1]].append(idx2)
+        hi = bisect.bisect_left(stamps[FOLLOWER], target)
+        if hi == len(q) or hi == 0:
+            raise ValueError('No state extrapolation allowed')
+        lo = hi-1
+        gap = stamps[FOLLOWER][hi]-stamps[FOLLOWER][lo]
+        if gap > 10_000_000:
+            raise ValueError('No interpolation over a >10ms state gap')
+        alpha = (target-stamps[FOLLOWER][lo])/gap
+        s = (1-alpha)*q[lo]+alpha*q[hi]
+        s[6] = q[lo, 6]  # causal hold, no interpolation across gripper changes
+        state.append(s)
+        rows.append(dict(frame=frame, camera_1_header_ns=target,
+                         camera_2_header_ns=stamps[CAMERAS[1]][idx2],
+                         camera_pair_offset_ms=delta/1e6,
+                         follower_before_ns=stamps[FOLLOWER][lo],
+                         follower_after_ns=stamps[FOLLOWER][hi],
+                         state_bracket_gap_ms=gap/1e6,
+                         gripper_hold_age_ms=(target-stamps[FOLLOWER][lo])/1e6,
+                         source_relative_seconds=(target-anchors[0][1])/1e9,
+                         nominal_dataset_seconds=frame/30))
+    output = root / 'results/aligned'
+    output.mkdir(exist_ok=False)
+    for c in (1, 2):
+        (output / f'camera_{c}').mkdir()
+    maps = {c: {raw: i for i, raw in enumerate(selected[c])} for c in CAMERAS}
+    count = {c: 0 for c in CAMERAS}
+    saved = {c: 0 for c in CAMERAS}
+    for topic, _, _, message in iter_messages(bag):
+        if topic == FOLLOWER:
+            continue
+        index = count[topic]; count[topic] += 1
+        if index not in maps[topic]:
+            continue
+        assert message.encoding == 'rgb8'
+        rgb = np.frombuffer(bytes(message.data), np.uint8).reshape(message.height, message.step)
+        rgb = rgb[:, :message.width*3].reshape(message.height, message.width, 3)
+        p = output / topic.split('/')[1] / f'{maps[topic][index]:06d}.png'
+        assert cv2.imwrite(str(p), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
+                           [cv2.IMWRITE_PNG_COMPRESSION, 1])
+        assert np.array_equal(cv2.cvtColor(cv2.imread(str(p)), cv2.COLOR_BGR2RGB), rgb)
+        saved[topic] += 1
+    assert all(n == len(state) for n in saved.values())
+    with (output / 'alignment.csv').open('w', newline='') as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        writer.writeheader(); writer.writerows(rows)
+    state = np.asarray(state, np.float32)
+    np.savez(output / 'samples.npz', state=state,
+             source_camera_1_header_ns=np.asarray([r['camera_1_header_ns'] for r in rows], np.int64),
+             source_camera_2_header_ns=np.asarray([r['camera_2_header_ns'] for r in rows], np.int64))
+    delta = [abs(r['camera_pair_offset_ms']) for r in rows]
+    retiming = [1000*(r['nominal_dataset_seconds']-r['source_relative_seconds']) for r in rows]
+    report = dict(rows=len(rows), master_used=False, rgb_roundtrip_lossless=True,
+                  state_width=7, camera_pair_offset_ms_p95=float(np.percentile(delta, 95)),
+                  camera_pair_offset_ms_max=max(delta),
+                  follower_bracket_gap_ms_max=max(r['state_bracket_gap_ms'] for r in rows),
+                  source_header_span_seconds=rows[-1]['source_relative_seconds'],
+                  nominal_fps=30, measured_anchor_fps=(len(rows)-1)/rows[-1]['source_relative_seconds'],
+                  nominal_vs_source_elapsed_ms_max=max(abs(v) for v in retiming),
+                  source_headers_preserved=True,
+                  source_follower_messages=len(stamps[FOLLOWER]),
+                  source_rgb_frames={k:len(v) for k,v in stamps.items() if k in CAMERAS},
+                  notes=['State is aligned at actual camera_1 header times.',
+                         'Nominal LeRobot index clock is 30Hz; real source headers are retained.',
+                         'Index-clock approximation is explicitly measured, not hidden timestamp replacement.',
+                         'ROS robot timestamp is publication time, not verified motor sampling time.',
+                         'This checks software alignment, not hardware exposure synchronization.'])
+    dump(root / 'results/alignment_report.json', report)
+    return state, report
+
+
+def load_actual_lingbot():
+    # Avoid unrelated distributed-training package initializers; all tested
+    # reader/transform/normalizer implementations are the actual server sources.
+    sys.path.insert(0, str(SOURCE))
+    import lingbotvla
+    base = Path(lingbotvla.__file__).parent
+    for name, path in [('lingbotvla.data',base/'data'),
+                       ('lingbotvla.data.vla_data',base/'data/vla_data')]:
+        package = types.ModuleType(name); package.__path__ = [str(path)]
+        sys.modules[name] = package
+    from lingbotvla.data.vla_data.base_dataset import VLADataset
+    from lingbotvla.data.vla_data.utils import FeatureTransform
+    from lingbotvla.data.vla_data.transform import prepare_state, prepare_action
+    return VLADataset, FeatureTransform, prepare_state, prepare_action
+
+
+def loader_check(root, state):
+    import torch
+    from PIL import Image
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    torch.set_num_threads(4)
+    result = root / 'results'
+    dataset_root = result / 'lerobot_probe'
+    features = {'observation.state':dict(dtype='float32',shape=(7,),
+                    names=[f'joint_{i}_rad' for i in range(1,7)]+['gripper_native'])}
+    for c in (1,2):
+        features[f'observation.images.camera_{c}'] = dict(
+            dtype='image',shape=(530,848,3),names=['height','width','channels'])
+    dataset = LeRobotDataset.create(repo_id='r5_probe/follower_validation_only',
+        root=dataset_root, fps=30, robot_type='arx_r5_single_follower',
+        features=features, use_videos=False, image_writer_threads=2)
+    # Artificial split only tests future-window boundary handling. It does not
+    # turn one physical demonstration into two valid training demonstrations.
+    split = len(state)//2
+    ranges = [(0,split),(split,len(state))]
+    for lo, hi in ranges:
+        for i in range(lo,hi):
+            frame = {'observation.state':state[i].copy(),
+                     'task':'recording_pipeline_validation_only_NOT_A_TRAINING_TASK'}
+            for c in (1,2):
+                with Image.open(result/'aligned'/f'camera_{c}'/f'{i:06d}.png') as img:
+                    frame[f'observation.images.camera_{c}'] = np.array(img.convert('RGB'))
+            dataset.add_frame(frame)
+        dataset.save_episode()
+    dataset.finalize()
+    config = dict(states=[
+        {'observation.state.arm.position':{'origin_keys':[{'observation.state':{'start':0,'end':6}}]}},
+        {'observation.state.effector.position':{'origin_keys':[{'observation.state':{'start':6,'end':7}}]}}],
+        actions=[{'action.arm.position':{'convert_from_state':True,'subtract_state':False}},
+                 {'action.effector.position':{'convert_from_state':True,'subtract_state':False}}],
+        images=[{f'observation.images.camera_{c}':{'origin_keys':f'observation.images.camera_{c}'}} for c in (1,2)],
+        norm_stats='NOT_COMPUTED_TEST_ONLY.json')
+    config_path = result/'r5_follower_probe.yaml'
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+    VLADataset, FeatureTransform, prepare_state, prepare_action = load_actual_lingbot()
+    data_config = types.SimpleNamespace(
+        joints=["{'arm.position':14}","{'end.position':14}","{'effector.position':2}"],
+        cameras=['camera_1','camera_2'])
+    model_config = types.SimpleNamespace(max_state_dim=55,max_action_dim=55)
+    transform = FeatureTransform(str(config_path),data_config,model_config,None,
+        chunk_size=50,do_nomalize=False,return_item_befor_padding=True)
+    transform.check_robot_config({k:v for k,v in config.items() if k!='norm_stats'})
+    ds = VLADataset(repo_id=str(dataset_root),data_name='r5_follower_probe',
+        dataset_config=data_config,robot_config_root=str(result),config=model_config,
+        processor=None,chunk_size=50,do_nomalize=True,return_item=True,
+        feature_transform=transform, image_size=(224,224))
+    assert len(ds)==len(state)
+    checks=[]
+    for lo, hi in ranges:
+        candidates=sorted(i for i in set([lo,lo+10,(lo+hi)//2,hi-51,hi-2,hi-1]) if lo <= i < hi)
+        for i in candidates:
+            out=ds[i]
+            actual_state=torch.cat([out['observation.state.arm.position'],
+                                    out['observation.state.effector.position']],dim=-1)
+            actual_action=torch.cat([out['action.arm.position'],out['action.effector.position']],dim=-1)
+            indices=np.minimum(np.arange(i+1,i+51),hi-1)
+            expected_pad=torch.from_numpy(np.arange(i+1,i+51)>=hi)
+            assert torch.allclose(actual_state,torch.from_numpy(state[i]),atol=1e-6)
+            assert torch.allclose(actual_action,torch.from_numpy(state[indices]),atol=1e-6)
+            assert torch.equal(out['action_is_pad'],expected_pad)
+            assert actual_action.shape==(50,7)
+            packed=transform.pad_and_concat(out,w_action=True)
+            assert prepare_state(packed,55).shape==(55,)
+            assert prepare_action(packed,55).shape==(50,55)
+            assert packed['state_joint_mask'].sum()==7 and packed['action_joint_mask'].sum()==7
+            for c in (1,2):
+                image=packed['image'][f'observation.images.camera_{c}']
+                assert image.dtype==torch.uint8 and tuple(image.shape)==(3,224,224)
+                assert image.float().std()>1
+            checks.append(dict(index=i,episode_end=hi,valid_future_steps=int((~expected_pad).sum())))
+    source_hashes={str(p.relative_to(SOURCE)):hashlib.sha256(p.read_bytes()).hexdigest()
+                   for p in [SOURCE/'lingbotvla/data/vla_data/base_dataset.py',
+                             SOURCE/'lingbotvla/data/vla_data/utils.py']}
+    report=dict(status='FOLLOWER_RGB_LOADER_TEST_PASS',tested_samples=checks,
+        master_used=False,rows=len(state),future_action_shape=[50,7],
+        padded_state_shape=[55],padded_action_shape=[50,55],valid_state_action_dimensions=7,
+        cameras=2,image_shape=[3,224,224],test_only=True,exclude_from_training=True,
+        synthetic_episode_split_for_boundary_test=ranges,source_hashes=source_hashes,
+        dependencies={n:importlib.metadata.version(n) for n in ['torch','torchvision','lerobot','datasets']},
+        tested_scope='actual server LeRobot + LingBot reader/feature transform and padding on CPU',
+        not_tested=['full training package initialization','normalization on real training dataset',
+                    'Qwen image processor/tokenizer','model forward/backward','deployment control',
+                    'hardware exposure synchronization or CAN sampling time'],
+        parent_training_initializers_bypassed=True,
+        no_source_methods_mocked=True)
+    dump(result/'loader_report.json',report)
+    return report
+
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--root',required=True,type=Path)
+    args=parser.parse_args(); root=args.root.resolve()
+    cv2.setNumThreads(1)
+    state_path=root/'results/status.json'
+    try:
+        dump(state_path,dict(stage='aligning',job_id=os.getenv('SLURM_JOB_ID'),gpu_requested=False,nice=0))
+        state, alignment=align(root)
+        dump(state_path,dict(stage='loader_validation',rows=len(state)))
+        report=loader_check(root,state)
+        dump(state_path,dict(stage='complete',status=report['status'],rows=len(state),master_used=False))
+        text=['# 从臂与相机数据服务器处理结果','',
+              f"状态：{report['status']}；对齐{len(state)}个观察，双相机，6轴+夹爪。",
+              f"相机间header差P95：{alignment['camera_pair_offset_ms_p95']:.3f}ms。",
+              f"从臂插值两采样最大间隔：{alignment['follower_bracket_gap_ms_max']:.3f}ms。",
+              '主臂未作为输入。已验证未来50步从臂轨迹、跨回合屏蔽、尾部padding及图像读取。',
+              '本结果仅为测试数据链路验收，不是正式训练数据、完整模型训练或硬件同步认证。',
+              '原始header保留。LeRobot采用30Hz名义索引时钟，真实采样间隔及其近似误差见alignment_report.json。',
+              '两个测试回合由一条物理录制人工分段，仅用于验证不跨回合取未来数据。',
+              '未改变任何机械臂、相机或共享训练代码。原始文件保留。']
+        (root/'results/REPORT_HANDOFF.md').write_text('\n\n'.join(text)+'\n')
+        print(json.dumps(dict(alignment=alignment,loader=report),indent=2),flush=True)
+    except Exception as exc:
+        dump(state_path,dict(stage='failed',error=repr(exc),traceback=traceback.format_exc()))
+        raise
+
+
+if __name__=='__main__':main()

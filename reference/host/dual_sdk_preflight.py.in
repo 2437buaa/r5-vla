@@ -1,0 +1,96 @@
+"""Read-only checks for isolated dual SDK startup; never opens CAN or enables motors."""
+import argparse
+from pathlib import Path
+import subprocess
+
+ROOT = Path(__file__).resolve().parent
+ROLES = {
+    'master': ('can0', '{{MASTER_CAN_SERIAL}}', '86', 'master_first_test', '/r5_master_test'),
+    'follower': ('can1', '{{FOLLOWER_CAN_SERIAL}}', '85', 'arm_first_test', '/r5_first_test'),
+}
+
+
+def validate_controller(argv, domain, role):
+    interface, _, expected_domain, node, topic = ROLES[role]
+    required = {
+        'arm_can_id': interface, 'arm_control_type': 'normal', 'arm_end_type': '0',
+        'arm_pub_topic_name': topic + '/arm_status',
+        'arm_sub_topic_name': topic + '/unused_arm_cmd',
+    }
+    # Require explicit unique settings; do not guess from config files/defaults.
+    for key, value in required.items():
+        values = [a.split(':=', 1)[1] for a in argv if a.startswith(key + ':=')]
+        if values != [value]:
+            raise RuntimeError(f'Unexpected existing SDK configuration: {key}={values}')
+    if [a for a in argv if a.startswith('__node:=')] != ['__node:=' + node]:
+        raise RuntimeError('Unexpected SDK node name')
+    if domain != expected_domain:
+        raise RuntimeError('Existing SDK has wrong/unknown ROS_DOMAIN_ID')
+
+
+def check(role, execute=False):
+    interface, serial, _, _, _ = ROLES[role]
+    device = Path('/dev/serial/by-id') / (
+        'usb-Openlight_Labs_CANable2_b158aa7_github.com_normaldotcom_canable2.git_'
+        + serial + '-if00')
+    if not device.exists():
+        raise RuntimeError(f'{role} adapter absent: {device}')
+    resolved = str(device.resolve())
+    info = subprocess.run(['/usr/sbin/ip', '-o', 'link', 'show', interface],
+                          check=True, capture_output=True, text=True).stdout
+    if '<' not in info or 'UP' not in info.split('<', 1)[1].split('>', 1)[0].split(','):
+        raise RuntimeError(f'{interface} not UP')
+    matching = []
+    controllers = []
+    for folder in Path('/proc').iterdir():
+        if not folder.name.isdigit():
+            continue
+        try:
+            name = (folder / 'comm').read_text().strip()
+        except FileNotFoundError:
+            continue
+        if name not in ('slcand', 'R5Controller'):
+            continue
+        try:
+            argv = (folder / 'cmdline').read_bytes().decode().rstrip('\0').split('\0')
+            if name == 'slcand':
+                if len(argv) >= 3 and argv[-1] == interface:
+                    if argv[-2] == resolved:
+                        matching.append(folder.name)
+                    elif Path(argv[-2]).exists():
+                        raise RuntimeError(f'Other live tty claims {interface}: PID {folder.name}')
+                    else:
+                        print(f'NOTICE: stale slcand PID {folder.name}, absent tty {argv[-2]}; not changed')
+                continue
+            env = dict(part.split('=', 1) for part in
+                       (folder / 'environ').read_bytes().decode().split('\0') if '=' in part)
+            interfaces = [a for a in argv if a.startswith('arm_can_id:=')]
+            found = [r for r, cfg in ROLES.items() if interfaces == ['arm_can_id:=' + cfg[0]]]
+            if len(found) != 1:
+                raise RuntimeError(f'Unknown SDK CAN binding: PID {folder.name}')
+            found_role = found[0]
+            validate_controller(argv, env.get('ROS_DOMAIN_ID'), found_role)
+            controllers.append((found_role, folder.name))
+        except FileNotFoundError:
+            continue  # Process exited during snapshot.
+        except PermissionError as exc:
+            raise RuntimeError(f'Cannot inspect relevant process {folder.name}; no startup') from exc
+    if len(matching) != 1:
+        raise RuntimeError(f'Expected one slcand for {resolved} -> {interface}, found {matching}')
+    for r in ROLES:
+        if sum(item[0] == r for item in controllers) > 1:
+            raise RuntimeError(f'Duplicate SDK already running for {r}')
+    running = [pid for r, pid in controllers if r == role]
+    if execute and running:
+        raise RuntimeError(f'{role} SDK already running: {running}; not restarted')
+    print(f'PREFLIGHT_PASS role={role} interface={interface} adapter={serial} tty={resolved} '
+          f'sdk_pids={running} slcand={matching}; process binding only, not motor health')
+    return running
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('role', choices=ROLES)
+    parser.add_argument('--execute', action='store_true', help='Reject duplicate target SDK; still read-only')
+    args = parser.parse_args()
+    check(args.role, args.execute)

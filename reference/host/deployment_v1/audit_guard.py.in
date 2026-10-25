@@ -1,0 +1,75 @@
+"""Apply the preview guard to EXISTING saved predictions; CPU, no inference/motion."""
+import argparse
+from collections import Counter
+from pathlib import Path
+import numpy as np
+from contract import read, write, digest
+from trajectory_guard import GuardRejected, guard_trajectory, validate_profile
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--root', type=Path, required=True)
+    parser.add_argument('--profile', type=Path, required=True)
+    parser.add_argument('--output', type=Path, required=True)
+    args = parser.parse_args()
+    profile = read(args.profile); validate_profile(profile)
+    args.output.mkdir(parents=True, exist_ok=False)
+    stats = {}
+    for step in (2000, 4000):
+        rows = []; raw_errors = []; filtered_errors = []; rejected = Counter()
+        predictions = sorted((args.root/'inference'/str(step)).glob('*.npz'))
+        if len(predictions) != 20:
+            raise ValueError('Expected the original 20 saved predictions per model')
+        for f in predictions:
+            with np.load(f, allow_pickle=False) as data:
+                actions, truth, padding = (data[k].copy() for k in ('actions', 'truth', 'padding'))
+            with np.load(args.root/'samples'/f.stem/'sample.npz', allow_pickle=False) as data:
+                state = data['state'].copy()
+            row = dict(id=f.stem, raw_prediction_sha256=digest(f), valid_future=int((~padding).sum()))
+            try:
+                # Age zero and stationary start are offline assumptions, not
+                # measurements of a robot or live network/feedback freshness.
+                result = guard_trajectory(actions, state, profile, observation_age_s=0)
+                out = np.array(result['guarded_actions'])
+                row.update(status=result['status'], diagnostics=result['diagnostics'])
+                valid = ~padding
+                if valid.any():
+                    raw_errors.append(abs(actions[valid]-truth[valid]))
+                    filtered_errors.append(abs(out[valid]-truth[valid]))
+                write(args.output/str(step)/(f.stem+'.json'), result)
+            except GuardRejected as exc:
+                rejected[exc.code] += 1
+                row.update(status='REJECTED', reason=exc.code, motor_commands_sent=False)
+                write(args.output/str(step)/(f.stem+'.json'), row)
+            rows.append(row)
+        accepted = [r for r in rows if r['status'] == 'PREVIEW_FILTERED']
+        metrics = {}
+        if raw_errors:
+            raw = np.concatenate(raw_errors); filtered = np.concatenate(filtered_errors)
+            metrics = dict(valid_targets_in_accepted_subset=len(raw),
+                raw_arm_mae_deg=float(np.rad2deg(raw[:, :6].mean())),
+                filtered_arm_mae_deg=float(np.rad2deg(filtered[:, :6].mean())),
+                raw_gripper_mae_native=float(raw[:, 6].mean()),
+                filtered_gripper_mae_native=float(filtered[:, 6].mean()))
+        stats[str(step)] = dict(proposals=len(rows), accepted=len(accepted),
+            rejected=len(rows)-len(accepted), rejection_reasons=dict(rejected),
+            max_arm_speed_deg_s=max((r['diagnostics']['max_arm_speed_deg_s'] for r in accepted), default=None),
+            max_arm_acceleration_deg_s2=max((r['diagnostics']['max_arm_acceleration_deg_s2'] for r in accepted), default=None),
+            max_gripper_speed_native_s=max((r['diagnostics']['max_gripper_speed_native_s'] for r in accepted), default=None),
+            **metrics, rows=rows)
+    write(args.output/'report.json', dict(status='PREVIEW_GUARD_AUDIT_COMPLETE',
+        profile_sha256=digest(args.profile),
+        guard_implementation_sha256=digest(Path(__file__).with_name('trajectory_guard.py')),
+        hardware_execution_eligible=False, motor_commands_sent=False,
+        source_scope='20 training-recording observations; no new inference or robot motion',
+        offline_assumptions='observation age=0 and initial velocity=0; no cross-chunk execution tested',
+        metrics_scope='raw and filtered errors use the SAME accepted subset only; rejects are not successes',
+        models=stats))
+    for step, s in stats.items():
+        print(step, {k: v for k, v in s.items() if k != 'rows'})
+    print('AUDIT_COMPLETE', args.output, 'No robot commands.')
+
+
+if __name__ == '__main__':
+    main()

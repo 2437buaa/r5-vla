@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+R5_TRAIN_BUNDLE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export R5_TRAIN_BUNDLE
+python3 - <<'PY'
+import json,os,subprocess
+from pathlib import Path
+b=Path(os.environ['R5_TRAIN_BUNDLE']);print('BUNDLE=',b)
+p=b/'submission.json'
+if p.exists():
+ s=json.loads(p.read_text());print(s)
+ ids=','.join(str(v) for v in s['jobs'].values())
+ subprocess.run(['sacct','-j',ids,'-X','--format=JobID,JobName,State,ExitCode,Elapsed,End'])
+for p in [b/'preparation_progress.json',b/'CPU_READY.json',*sorted((b/'output/progress').glob('rank_*.json')),*sorted((b/'output').glob('CHECKPOINT_READY_STEP_*.json')),b/'output/FINAL_ACCEPTANCE.json']:
+ if p.exists():
+  m=json.loads(p.read_text());m.pop('last',None);print(p.name,m)
+if not list((b/'output/progress').glob('rank_*.json')):
+ print('尚未记录任何优化器更新；RUNNING不等于训练已推进。请查看当前train-作业号.out/.err。')
+PY

@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+#SBATCH --job-name=r5-charger-4k
+#SBATCH --partition=gpu
+#SBATCH --gres=gpu:2
+#SBATCH --cpus-per-task=12
+#SBATCH --mem=160G
+#SBATCH --time=1-12:00:00
+#SBATCH --nice=0
+set -euo pipefail
+export PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
+export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+export PYTHONPATH={{LINGBOT_SOURCE}}
+export TMPDIR="{{SERVER_ROOT}}/tmp/r5_${SLURM_JOB_ID}"
+mkdir -p "$TMPDIR"
+export R5_EXPECTED_IPC_PROOF="$R5_TRAIN_BUNDLE/ipc-${SLURM_JOB_ID}.json"
+CUDA_VISIBLE_DEVICES='' {{TRAIN_PYTHON}} \
+  "$R5_TRAIN_BUNDLE/scripts/ipc_preflight.py" "$R5_EXPECTED_IPC_PROOF"
+cd {{LINGBOT_SOURCE}}
+{{TRAIN_PYTHON}} -m torch.distributed.run \
+  --standalone --nnodes=1 --nproc-per-node=2 "$R5_TRAIN_BUNDLE/scripts/train.py"
+{{TRAIN_PYTHON}} "$R5_TRAIN_BUNDLE/scripts/finalize.py" "$R5_TRAIN_BUNDLE"

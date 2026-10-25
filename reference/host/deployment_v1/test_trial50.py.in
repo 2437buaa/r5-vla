@@ -1,0 +1,202 @@
+"""Pure and simulated execution tests: no DDS, CAN, SDK, HTTP or robot."""
+from collections import deque
+from copy import deepcopy
+import json
+import math
+from pathlib import Path
+import struct
+import sys
+import tempfile
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+import numpy as np
+import trial50 as trial
+
+
+class ValidationTests(unittest.TestCase):
+    def setUp(self):
+        self.q=np.array(trial.TARGET+[0.],float)
+        self.a=np.tile(self.q,(50,1)).astype(np.float32)
+        self.envelope=json.loads(Path(trial.__file__).with_name('guard_profile.json').read_text())
+
+    def test_valid_raw_chunk_unchanged(self):
+        self.a[:,0]+=np.arange(50,dtype=np.float32)*.0001
+        before=self.a.copy();v=trial.validate_chunk(self.a,self.q,self.envelope)
+        self.assertTrue(v['passed']);np.testing.assert_array_equal(self.a,before)
+        self.assertFalse(v['actions_modified'])
+
+    def test_large_first_target_only_warns(self):
+        self.a[:,1]+=.15
+        r=trial.validate_chunk(self.a,self.q,self.envelope)
+        self.assertIn('FIRST_ARM_JUMP_GT_3DEG',r['warnings']);self.assertTrue(r['passed'])
+
+    def test_empirical_adjacent_speed_only_warns(self):
+        self.a[49,0]+=.05
+        r=trial.validate_chunk(self.a,self.q,self.envelope)
+        self.assertIn('ADJACENT_TARGET_SPEED_GT_1RAD_S_AT_30HZ',r['warnings']);self.assertTrue(r['passed'])
+
+    def test_initial_transition_in_nominal_speed_check(self):
+        self.a[:,0]+=.04
+        self.assertIn('ADJACENT_TARGET_SPEED_GT_1RAD_S_AT_30HZ',trial.validate_chunk(self.a,self.q,self.envelope)['warnings'])
+
+    def test_gripper_jump_not_silently_clipped(self):
+        self.a[20,6]=2.;before=self.a.copy()
+        r=trial.validate_chunk(self.a,self.q,self.envelope)
+        self.assertTrue(r['passed']);self.assertTrue(r['warnings'])
+        np.testing.assert_array_equal(before,self.a)
+
+    def test_vendor_sdk_arm_saturation_is_not_a_chunk_rejection(self):
+        self.a[20,0]=trial.sdk_arm_limits()['upper'][0]+.01
+        before=self.a.copy()
+        r=trial.validate_chunk(self.a,self.q,self.envelope)
+        self.assertTrue(r['passed']);self.assertEqual(r['reasons'],[])
+        self.assertIn('TARGET_OUTSIDE_VENDOR_SDK_ARM_BOUNDS_HANDLED_BY_SDK',r['warnings'])
+        np.testing.assert_array_equal(self.a,before)
+        self.assertEqual(r['sdk_arm_limit_events'][0]['step'],21)
+        self.assertEqual(r['sdk_arm_limit_events'][0]['joint'],1)
+
+    def test_tracking_reference_uses_sdk_bounds_without_mutating_raw(self):
+        row=self.q.copy();row[1]=-.10933159291744232;before=row.copy()
+        limits=trial.sdk_arm_limits();reference=trial.sdk_arm_tracking_reference(row,limits)
+        self.assertEqual(reference[1],-.1)
+        np.testing.assert_array_equal(row,before)
+
+    def test_bad_shape_or_numeric_rejected(self):
+        for a in (self.a[:5],np.full((50,7),np.nan)):
+            with self.assertRaises(ValueError):trial.validate_chunk(a,self.q,self.envelope)
+
+
+class MainSimulationTests(unittest.TestCase):
+    def run_case(self,fault=None,execute=True,max_actions=50,finish_after=None):
+        clock=[0.];commands=[];holder={'can':deque(),'publisher':False}
+        limits=trial.sdk_arm_limits()
+        initial=np.array(trial.TARGET+[0.],float)
+        a=np.tile(initial,(50,1)).astype(np.float32);a[:,0]+=np.arange(50,dtype=np.float32)*.0001
+        if fault=='sdk_saturates':a[-1,0]=limits['upper'][0]+.1
+        if fault=='empirical_warning':a[:,0]+=.04
+        class Message:
+            def __init__(self):
+                self.header=SimpleNamespace(stamp=None)
+                self.end_pos=[0.]*6;self.joint_pos=initial.tolist();self.joint_vel=[0.]*7;self.joint_cur=[0.]*7
+        class Obs:
+            @property
+            def buffers(self):
+                return {name:[(0,None,int(clock[0]*1e9))] for name in ('camera_1','camera_2')}
+            def latest(self):
+                return dict(state=initial.astype(np.float32).copy(),camera_1=None,camera_2=None,
+                    stamps={'camera_1_header_ns':int(clock[0]*1e9)},selected_received_monotonic_ns=int(clock[0]*1e9))
+        class Node:
+            def __init__(self):self.observations=Obs();self.invalid=0
+            def create_subscription(self,typ,topic,cb,qos):holder['cb']=cb;return object()
+            def count_publishers(self,topic):
+                if topic==trial.STATUS:return 1
+                return int(holder['publisher'])+(1 if fault=='competing' else 0)
+            def create_publisher(self,*args):holder['publisher']=True;return self
+            def get_subscription_count(self):return 1
+            def get_clock(self):return self
+            def now(self):return self
+            def to_msg(self):return None
+            def publish(self,msg):commands.append(deepcopy(msg))
+            def destroy_node(self):pass
+        class CAN:
+            def setsockopt(self,*args):pass
+            def bind(self,*args):pass
+            def setblocking(self,*args):pass
+            def close(self):pass
+            def recv(self,*args):
+                if not holder['can']:raise BlockingIOError()
+                return holder['can'].popleft()
+        def spin(*args,**kwargs):
+            clock[0]+=.001
+            msg=Message()
+            if commands:
+                msg.joint_pos=trial.sdk_arm_tracking_reference(commands[-1].joint_pos,limits)+[commands[-1].gripper]
+                if fault=='tracking':msg.joint_pos[0]+=.031
+                if fault=='speed':msg.joint_vel[0]=1.01
+                if fault=='schedule':clock[0]+=.1
+            holder['cb'](msg)
+            holder['can']=deque(struct.pack('=IB3x8s',0,8,bytes([16+i])+bytes(7)) for i in trial.IDS if fault!='missing_can' or i!=2)
+        ros=SimpleNamespace(init=lambda **kw:None,ok=lambda:True,shutdown=lambda:None,spin_once=spin)
+        class Immediate:
+            def done(self):return True
+            def result(self):return a.copy(),dict(actions=a.tolist(),client_roundtrip_ms=1,step=4000)
+        class Executor:
+            def __init__(self,*args,**kwargs):pass
+            def submit(self,*args,**kwargs):return Immediate()
+            def shutdown(self,**kwargs):pass
+        def fields(msg):return {k:list(getattr(msg,k)) for k in ('end_pos','joint_pos','joint_vel','joint_cur')},True
+        modules={'rclpy':ros,'rclpy.qos':SimpleNamespace(qos_profile_sensor_data=None),
+            'arx5_arm_msg':SimpleNamespace(),'arx5_arm_msg.msg':SimpleNamespace(RobotCmd=Message,RobotStatus=Message),
+            'readonly_preview':SimpleNamespace(PreviewNode=Node),'monitor_first_sdk_test':SimpleNamespace(fields=fields)}
+        with tempfile.TemporaryDirectory(prefix='r5-trial50-mock-') as directory:
+            root=Path(directory);(root/'logs').mkdir()
+            sdk_log=root/'sdk.log';sdk_log.write_text('电机掉线\n' if fault=='sdk_fault' else 'Init completed\n')
+            argv=['test','--sdk-log',str(sdk_log),'--max-actions',str(max_actions)]+(['--execute','--confirm-clear'] if execute else [])
+            with patch.dict(sys.modules,modules),patch.dict('os.environ',{'ROS_DOMAIN_ID':'85'}), \
+                patch.object(trial,'HOST',root),patch.object(trial,'binding_preflight',return_value={'sdk_pid':'fake'}), \
+                patch.object(trial,'sdk_identity',return_value=('start',b'cmd')), \
+                patch.object(trial,'server_health',return_value={'step':4000}), \
+                patch.object(trial.socket,'socket',return_value=CAN()), \
+                patch.object(trial,'ThreadPoolExecutor',Executor), \
+                patch.object(trial,'terminal_completion_requested',side_effect=lambda stream:finish_after is not None and len(commands)>=finish_after), \
+                patch.object(sys.stdin,'isatty',return_value=True), \
+                patch.object(trial.time,'monotonic',side_effect=lambda:clock[0]), \
+                patch.object(trial.time,'monotonic_ns',side_effect=lambda:int(clock[0]*1e9)), \
+                patch('sys.argv',argv),patch('builtins.print'):
+                if fault and fault not in ('empirical_warning','sdk_saturates'):
+                    with self.assertRaises(RuntimeError):trial.main()
+                else:trial.main()
+            s=json.loads(next(root.glob('logs/model-*/summary.json')).read_text())
+        return commands,s,holder['publisher'],a
+
+    def test_exactly_50_original_targets_and_no_reset(self):
+        cmds,s,pub,a=self.run_case()
+        self.assertEqual(len(cmds),50);self.assertEqual(s['status'],'SENT_50_TARGETS_FEEDBACK_OBSERVED')
+        for msg,row in zip(cmds,a):
+            self.assertEqual(msg.joint_pos,list(map(float,row[:6])))
+            self.assertEqual(msg.gripper,float(row[6]));self.assertEqual(msg.mode,5)
+
+    def test_dry_run_does_not_even_create_publisher(self):
+        cmds,s,pub,a=self.run_case(execute=False)
+        self.assertFalse(pub);self.assertEqual(cmds,[]);self.assertEqual(s['status'],'DRY_RUN_VALIDATED_NO_COMMANDS')
+
+    def test_500_target_task_with_ten_new_observation_chunks(self):
+        cmds,s,pub,a=self.run_case(max_actions=500)
+        self.assertEqual(len(cmds),500);self.assertEqual(s['status'],'ACTION_LIMIT_REACHED')
+        self.assertEqual(len(s['chunks']),10)
+        stamps=[r['source_stamps']['camera_1_header_ns'] for r in s['chunks']]
+        self.assertTrue(all(b>a for a,b in zip(stamps,stamps[1:])))
+        self.assertTrue(all(r['commands_sent']==50 for r in s['chunks']))
+
+    def test_operator_completion_mid_chunk_stops_new_targets(self):
+        cmds,s,pub,a=self.run_case(max_actions=500,finish_after=73)
+        self.assertEqual(len(cmds),73)
+        self.assertEqual(s['status'],'OPERATOR_REPORTED_TASK_COMPLETE')
+        self.assertTrue(s['operator_reported_success']);self.assertFalse(s['task_success_verified'])
+
+    def test_sdk_saturation_does_not_reject_or_modify_raw_chunk(self):
+        cmds,s,pub,a=self.run_case('sdk_saturates')
+        self.assertTrue(pub);self.assertEqual(len(cmds),50)
+        self.assertEqual(s['status'],'SENT_50_TARGETS_FEEDBACK_OBSERVED')
+        self.assertEqual(cmds[-1].joint_pos,list(map(float,a[-1,:6])))
+
+    def test_empirical_warning_not_a_hidden_hard_block_and_no_filter(self):
+        cmds,s,pub,a=self.run_case('empirical_warning')
+        self.assertEqual(len(cmds),50)
+        self.assertEqual(cmds[0].joint_pos,list(map(float,a[0,:6])))
+        self.assertEqual(cmds[-1].joint_pos,list(map(float,a[-1,:6])))
+
+    def test_schedule_fault_no_more_commands(self):
+        # Position/speed stops were already commented out in the operator's
+        # source before the500-step change; do not assert they remain active.
+        cmds,s,pub,a=self.run_case('schedule')
+        self.assertEqual(len(cmds),1)
+
+    def test_missing_can_sdk_fault_or_competing_publisher_no_commands(self):
+        for fault in ('missing_can','sdk_fault','competing'):
+            cmds,s,pub,a=self.run_case(fault)
+            self.assertEqual(cmds,[]);self.assertFalse(pub)
+
+
+if __name__=='__main__':unittest.main()

@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+R5_MONITOR_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+exec env -u PYTHONPATH -u PYTHONHOME -u LD_LIBRARY_PATH \
+  -u CMAKE_PREFIX_PATH -u AMENT_PREFIX_PATH -u COLCON_PREFIX_PATH \
+  -u CONDA_PREFIX -u CONDA_DEFAULT_ENV -u CONDA_SHLVL \
+  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  LANG=C.UTF-8 LC_ALL=C.UTF-8 PYTHONNOUSERSITE=1 ROS_LOCALHOST_ONLY=1 \
+  /bin/bash --noprofile --norc -c '
+    source /opt/ros/humble/setup.bash
+    source {{ROS_WORKSPACE}}/install/setup.bash
+    exec /usr/bin/python3 "$1/monitor_first_sdk_test.py" "${@:2}"
+  ' r5-monitor "$R5_MONITOR_ROOT" "$@"

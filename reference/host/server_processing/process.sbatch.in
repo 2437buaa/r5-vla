@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+#SBATCH --job-name=r5-follower-data-check
+#SBATCH --partition=gpu
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=16G
+#SBATCH --time=00:40:00
+#SBATCH --nice=0
+
+set -euo pipefail
+R5_DATA_ROOT={{DECODER_ENV}}
+cd "$R5_DATA_ROOT"
+export CUDA_VISIBLE_DEVICES=""
+export OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 MKL_NUM_THREADS=4
+export HF_HOME="$R5_DATA_ROOT/cache/huggingface"
+export HF_DATASETS_CACHE="$R5_DATA_ROOT/cache/datasets"
+export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+export PYTHONDONTWRITEBYTECODE=1 TOKENIZERS_PARALLELISM=false
+export MPLCONFIGDIR="$R5_DATA_ROOT/cache/matplotlib"
+export TMPDIR="$R5_DATA_ROOT/cache/tmp"
+mkdir -p "$TMPDIR"
+export PYTHONPATH="$R5_DATA_ROOT/deps_active:{{LINGBOT_SOURCE}}"
+sha256sum --check scripts/INPUT_SHA256SUMS
+exec {{TRAIN_PYTHON}} -u \
+  "$R5_DATA_ROOT/scripts/validate_follower.py" --root "$R5_DATA_ROOT"

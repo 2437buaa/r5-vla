@@ -1,0 +1,142 @@
+"""Run a frozen copy of the upstream trainer with evidence at its actual boundaries."""
+import inspect
+import math
+import os
+from pathlib import Path
+import sys
+import shutil
+
+from common import SOURCE, BASE, STEPS, read, write, sha
+
+bundle = Path(os.environ['R5_TRAIN_BUNDLE']).resolve()
+assert read(bundle/'CPU_READY.json')['status'] == 'PASS'
+assert read(os.environ['R5_EXPECTED_IPC_PROOF'])['status']=='PASS'
+base_proof=read(bundle/'BASE_VERIFIED.json')
+assert base_proof['status']=='PASS' and base_proof['repo']=='robbyant/lingbot-vla-v2-6b'
+for shard in base_proof['shards']:
+    assert sha(BASE/shard['file'])==shard['expected_sha256'],('base shard changed',shard['file'])
+for name, digest in read(bundle/'bindings.json').items():
+    assert sha(name) == digest, ('changed prepared input',name)
+assert shutil.disk_usage(bundle).free > 190*1024**3, 'insufficient checkpoint headroom'
+sys.path.insert(0,str(SOURCE)); os.chdir(SOURCE)
+import torch
+import torch.distributed as dist
+from lingbotvla.data.vla_data.utils import FeatureTransform
+from lingbotvla.data.vla_data.multi_vla_dataset import MultiVLADataset
+from lingbotvla.data.data_loader import DistributedDataloader
+from lingbotvla.utils.async_hf_checkpoint import AsyncHFCheckpointSaver
+from lingbotvla.models.loader import LingBotVLAWeightLoader
+import lingbotvla.models as model_api
+
+# This RGB-only baseline disables the two auxiliary distillation branches.
+# Skip only their enumerated checkpoint keys; upstream post-training loading
+# must still reject any missing or unexpected backbone/action parameter.
+aux_names={'current_shared_task_proj','current_video_align_embs','current_video_align_head',
+           'depth_align_embs','depth_align_head','future_depth_align_embs','future_depth_align_head',
+           'future_shared_task_proj','future_video_align_embs','future_video_align_head'}
+base_index=read(BASE/'model.safetensors.index.json')['weight_map']
+allowed_skip={k for k in base_index if k.split('.')[0]=='model' and k.split('.')[1] in aux_names}
+assert len(allowed_skip)==84
+seen_skips=set()
+original_key_map=LingBotVLAWeightLoader.map_ckpt_key
+def key_map(self,key,load_vlm_only,post_training):
+    assert post_training and not load_vlm_only
+    if key in allowed_skip:
+        seen_skips.add(key)
+        return None
+    return original_key_map(self,key,load_vlm_only,post_training)
+LingBotVLAWeightLoader.map_ckpt_key=key_map
+original_build=model_api.build_foundation_model
+def build_model(*args,**kwargs):
+    assert Path(kwargs['weights_path']).resolve()==BASE
+    model=original_build(*args,**kwargs)
+    assert seen_skips==allowed_skip
+    assert not model.config.align_params
+    write(bundle/'output/base_load_proof'/f'rank_{os.environ["RANK"]}.json',dict(
+        base_repo=base_proof['repo'],base_revision=base_proof['revision'],
+        backbone_and_action_loading='upstream strict post_training=True, incremental_training=False',
+        disabled_auxiliary_keys=sorted(seen_skips),disabled_auxiliary_count=84,verified=True))
+    return model
+model_api.build_foundation_model=build_model
+
+original_normalizer = FeatureTransform.get_normalizer
+def bound_normalizer(self,path,*args,**kwargs):
+    assert Path(path).resolve() == bundle/'normalization_stats.json'
+    assert sha(path) == read(bundle/'CPU_READY.json')['normalization_sha256']
+    result = original_normalizer(self,path,*args,**kwargs)
+    write(bundle/'output/normalization_proof'/f'rank_{os.environ["RANK"]}.json',
+        dict(path=str(path),sha256=sha(path),types=result.norm_type,
+             norm_keys=list(result.norm_stats),verified=True))
+    return result
+FeatureTransform.get_normalizer = bound_normalizer
+# Validated R5 data must fail with the original index, not be replaced by a random sample.
+MultiVLADataset.__getitem__ = MultiVLADataset.getdata
+original_loader_init=DistributedDataloader.__init__
+def bounded_loader_init(self,*args,**kwargs):
+    kwargs['timeout']=180 if kwargs.get('num_workers',0)>0 else 0
+    result=original_loader_init(self,*args,**kwargs)
+    write(bundle/'output/loader_settings'/f'rank_{os.environ["RANK"]}.json',dict(
+        timeout_seconds=kwargs['timeout'],num_workers=kwargs.get('num_workers',0),
+        TMPDIR=os.environ.get('TMPDIR')))
+    return result
+DistributedDataloader.__init__=bounded_loader_init
+
+original_submit = AsyncHFCheckpointSaver.submit
+signature = inspect.signature(original_submit)
+def unique_submit(self,*args,**kwargs):
+    step = signature.bind(self,*args,**kwargs).arguments['global_step']
+    assert step in (2000,4000)
+    submitted = getattr(self,'_r5_submitted',set())
+    if step in submitted:
+        return
+    result = original_submit(self,*args,**kwargs)
+    checkpoint=bundle/'output/checkpoints'/f'global_step_{step}'
+    hf=checkpoint/'hf_ckpt'
+    index=read(hf/'model.safetensors.index.json')
+    for name in set(index['weight_map'].values()):
+        assert (hf/name).stat().st_size>1000000
+    provenance=checkpoint/'r5_provenance'; provenance.mkdir(exist_ok=True)
+    for path in [bundle/'normalization_stats.json',bundle/'train.yaml',
+                 bundle/'robot_configs/r5_follower.yaml',bundle/'deployment_contract.json',
+                 bundle/'BASE_VERIFIED.json']:
+        shutil.copy2(path,provenance/path.name)
+    write(bundle/'output'/f'CHECKPOINT_READY_STEP_{step}.json',dict(status='HF_EXPORT_READY',
+        global_step=step,hf_checkpoint=str(hf),provenance=str(provenance),
+        normalization_sha256=sha(bundle/'normalization_stats.json'),
+        training_continues=step<STEPS,real_robot_deployment_tested=False))
+    print('R5_CHECKPOINT_READY',step,hf,flush=True)
+    submitted.add(step); self._r5_submitted=submitted
+    return result
+AsyncHFCheckpointSaver.submit = unique_submit
+
+def record_step(step,loss,vla,grad,lrs):
+    values = [float(loss),float(vla),float(grad)]
+    assert all(math.isfinite(x) for x in values), ('nonfinite training metrics',values)
+    assert 1 <= step <= STEPS
+    if step == 1 or step % 10 == 0:
+        write(bundle/'output/progress'/f'rank_{dist.get_rank()}.json',dict(
+            global_step=step,target_steps=STEPS,percent=100*step/STEPS,
+            loss=values[0],vla_loss=values[1],gradient_norm=values[2],learning_rates=lrs))
+    if step == 1:
+        write(bundle/'output/forward_backward_pass'/f'rank_{dist.get_rank()}.json',
+            dict(status='PASS',finite_loss=True,finite_gradient_norm=True,
+                 first_optimizer_update_completed=True))
+
+source=(bundle/'official_train_snapshot.py').read_text()
+anchors={
+    '                    loss.backward()':
+    '                    assert torch.isfinite(loss).all(), "nonfinite loss"\n                    loss.backward()',
+    '            optimizer.step()':
+    '            assert torch.isfinite(grad_norm.full_tensor() if hasattr(grad_norm, "full_tensor") else torch.as_tensor(grad_norm)).all(), "nonfinite gradient norm"\n            optimizer.step()',
+    '            all_lrs = lr_scheduler.get_last_lr()':
+    '            all_lrs = lr_scheduler.get_last_lr()\n            record_step(global_step,total_loss,total_vla_loss,grad_norm,all_lrs)',
+}
+for old,new in anchors.items():
+    assert source.count(old)==1,('source anchor mismatch',old)
+    source=source.replace(old,new)
+sys.argv=[str(bundle/'official_train_snapshot.py'),str(bundle/'train.yaml')]
+exec(compile(source,str(bundle/'official_train_snapshot.py'),'exec'),
+     {'__name__':'__main__','__file__':str(SOURCE/'tasks/vla/train_lingbotvla.py'),'record_step':record_step})
+rank=os.environ['RANK']
+assert read(bundle/'output/progress'/f'rank_{rank}.json')['global_step']==STEPS
+write(bundle/'output/completion'/f'rank_{rank}.json',dict(status='TRAINING_RETURNED',global_step=STEPS))

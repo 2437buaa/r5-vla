@@ -1,0 +1,60 @@
+"""Pair live RGB and follower publication timestamps like the audited dataset."""
+import bisect
+from collections import deque
+import time
+import numpy as np
+
+
+class ObservationBuffer:
+    def __init__(self):
+        self.buffers={name:deque(maxlen=2000 if name=='state' else 15)
+                      for name in ('state','camera_1','camera_2')}
+        self.non_increasing=0
+
+    def add(self,name,stamp_ns,value,received_ns=None):
+        values=self.buffers[name]
+        if values and stamp_ns<=values[-1][0]:
+            self.non_increasing+=1;return False
+        values.append((int(stamp_ns),value,time.monotonic_ns() if received_ns is None else received_ns))
+        return True
+
+    def latest(self,now_ns=None):
+        now=time.monotonic_ns() if now_ns is None else now_ns
+        copied={name:list(values) for name,values in self.buffers.items()}
+        if any(len(v)<2 for v in copied.values()):raise ValueError('waiting for both RGB streams and follower state')
+        if any(now-v[-1][2]>500_000_000 for v in copied.values()):raise ValueError('a required stream is stale >500ms')
+        begin=max(v[0][0] for v in copied.values());end=min(v[-1][0] for v in copied.values())
+        anchors=[v for v in copied['camera_1'] if begin<v[0]<=end]
+        if not anchors:raise ValueError('no common camera/state time range')
+        t,image1,rx1=anchors[-1]
+        t2,image2,rx2=min(copied['camera_2'],key=lambda v:abs(v[0]-t))
+        if abs(t2-t)>16_700_000:raise ValueError('camera pair offset >16.7ms')
+        if now-min(rx1,rx2)>500_000_000:raise ValueError('selected image is stale >500ms')
+        qs=copied['state'];stamps=[v[0] for v in qs];hi=bisect.bisect_left(stamps,t)
+        if not 0<hi<len(qs):raise ValueError('state interpolation would extrapolate')
+        lo=hi-1;gap=stamps[hi]-stamps[lo]
+        if not 0<gap<=10_000_000:raise ValueError('state bracket exceeds10ms')
+        alpha=(t-stamps[lo])/gap
+        state=np.asarray(qs[lo][1],np.float32)*(1-alpha)+np.asarray(qs[hi][1],np.float32)*alpha
+        state[6]=qs[lo][1][6]  # match recording preprocessing's causal hold
+        if state.shape!=(7,) or not np.isfinite(state).all():raise ValueError('invalid seven-dimensional follower state')
+        return dict(state=state,camera_1=image1,camera_2=image2,
+            selected_received_monotonic_ns=min(rx1,rx2,qs[lo][2],qs[hi][2]),stamps=dict(
+            camera_1_header_ns=t,camera_2_header_ns=t2,
+            follower_before_ns=stamps[lo],follower_after_ns=stamps[hi],
+            camera_offset_ms=(t2-t)/1e6,state_bracket_ms=gap/1e6,
+            software_timestamp_semantics='camera headers; robot SDK publication time'))
+
+    def feedback_snapshot(self,now_ns=None,max_age_s=.1):
+        """Latest received state for preview re-anchoring, NOT motor freshness proof."""
+        if not self.buffers['state']:
+            raise ValueError('no follower feedback')
+        now=time.monotonic_ns() if now_ns is None else now_ns
+        stamp,q,received=self.buffers['state'][-1]
+        age=(now-received)/1e9
+        if not 0<=age<=max_age_s:
+            raise ValueError('follower feedback stale or invalid clock')
+        q=np.asarray(q,np.float64).copy()
+        if q.shape!=(7,) or not np.isfinite(q).all():
+            raise ValueError('invalid follower feedback')
+        return q,age,stamp

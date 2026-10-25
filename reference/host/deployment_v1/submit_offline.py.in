@@ -1,0 +1,23 @@
+"""Submit only a finite recorded-data inference job, no robot or live server."""
+import os
+from pathlib import Path
+import subprocess
+import sys
+from contract import read,write
+
+b=Path(__file__).resolve().parent.parent
+gate=sys.argv[1];assert gate.isdecimal()
+assert read(b/'CPU_READY.json')['status']=='PASS'
+state=subprocess.check_output(['sacct','-j',gate,'-X','-n','-P','--format=State,ExitCode'],text=True).strip()
+assert state=='COMPLETED|0:0',state
+fd=os.open(b/'OFFLINE_SUBMIT_LOCK',os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600);os.close(fd)
+env=dict(os.environ,R5_DEPLOY_ROOT=str(b))
+job=subprocess.check_output(['sbatch','--parsable','--nice=0',f'--dependency=afterok:{gate}',
+    '--kill-on-invalid-dep=yes',f'--output={b}/logs/offline-%j.out',f'--error={b}/logs/offline-%j.err',
+    str(b/'scripts/offline.sbatch')],text=True,env=env).strip().split(';')[0]
+assert job.isdecimal(),job
+write(b/'submission.json',dict(state='submitted',jobs={'cpu':gate,'offline':job},nice=0,
+    gpu_count=1,model_steps=[2000,4000],motion_commands_sent=False,
+    purpose='recorded-observation inference and latency checks only',root=str(b)))
+print('R5_OFFLINE_JOB_ID='+job,flush=True)
+subprocess.run(['scontrol','show','job',job,'-o'],check=True)

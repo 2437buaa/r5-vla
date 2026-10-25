@@ -1,0 +1,353 @@
+"""Fresh 50-target model chunks at nominal30Hz, with a bounded total action budget.
+
+Default budget50; task500.sh selects500. Default is dry-run. No smoothing,
+clipping, reset, SDK startup, or auto-retreat. Re-observe after each chunk.
+Empirical model-output thresholds only WARN; they are not physical limits.
+Malformed output still rejects. Arm-bound saturation is left to the original SDK;
+the bridge records it but neither rejects the chunk nor changes outgoing targets.
+Runtime feedback checks remain active. No software check is a certified stop.
+"""
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime,timezone
+import fcntl
+import json
+import math
+import os
+from pathlib import Path
+import select
+import socket
+import struct
+import sys
+import time
+import numpy as np
+from client import health as server_health,infer
+from contract import write,HORIZON,ACTION_HZ
+from raw_preview import describe
+
+HOST=Path(__file__).resolve().parent.parent
+sys.path.insert(0,str(HOST))
+from move_to_demo_start import binding_preflight,SustainedSpeedWatch,IDS,STATUS,COMMAND,TARGET
+from sdk_online_latch_repro import SDK,SHA
+import hashlib
+
+POLICY=dict(first_arm_jump_deg=3.,adjacent_command_speed_rad_s=1.,
+    chunk_arm_excursion_deg=60.,first_gripper_jump_native=.15,
+    adjacent_gripper_jump_native=.10,chunk_gripper_excursion_native=1.5,
+    instantaneous_feedback_speed_rad_s=1.,sustained_feedback_speed_rad_s=.20,
+    sustained_speed_seconds=.10,tracking_error_rad=.03,
+    model_output_threshold_mode='warnings_only',
+    arm_limit_handling='vendor_sdk_native_saturation_then_interpolation',
+    trial_bounds_kind='model-output empirical values are advisory; runtime checks remain stops')
+PROFILE='vendor-sdk-limits-v3'
+
+
+def sdk_arm_limits():
+    """Read ONLY the known library file; never construct a controller or open CAN.
+
+    DWARF identifies ControllerBase lower_Joint/upper_Joint. Constructor at
+    0x15139f..0x1514dc stores these constants; .rodata file and VA offsets match.
+    These are SDK software bounds, NOT a claim of certified physical limits.
+    """
+    b=SDK.read_bytes()
+    if hashlib.sha256(b).hexdigest()!=SHA:raise RuntimeError('Vendor library changed; bounds need review')
+    lower=[struct.unpack_from('<d',b,o)[0] for o in (0x1c0318,0x1c0320,0x1c0320,0x1c0328,0x1c0330,0x1c0338)]
+    upper=[struct.unpack_from('<d',b,o)[0] for o in (0x1c0340,0x1c0348,0x1c0350,0x1c0358,0x1c0360,0x1c0368)]
+    return dict(lower=lower,upper=upper,source='pinned original ControllerBase constructor',sdk_sha256=SHA,
+        physical_safety_certified=False)
+
+
+def sdk_identity(binding):
+    proc=Path('/proc')/binding['sdk_pid']
+    return ((proc/'stat').read_text().rsplit(')',1)[1].split()[19],(proc/'cmdline').read_bytes())
+
+
+def validate_chunk(actions,state,envelope,arm_limits=None):
+    a=np.asarray(actions,dtype=np.float32);q=np.asarray(state,dtype=np.float64)
+    if a.shape!=(50,7) or q.shape!=(7,) or not np.isfinite(a).all() or not np.isfinite(q).all():
+        raise ValueError('Expected finite 50x7 targets and 7D feedback')
+    reasons=[];arm=a[:,:6];delta=arm-q[:6]
+    if np.max(np.abs(delta[0]))>math.radians(POLICY['first_arm_jump_deg']):reasons.append('FIRST_ARM_JUMP_GT_3DEG')
+    nominal_speed=np.abs(np.diff(np.vstack([q[:6],arm]),axis=0))*ACTION_HZ
+    if np.max(nominal_speed)>POLICY['adjacent_command_speed_rad_s']:
+        reasons.append('ADJACENT_TARGET_SPEED_GT_1RAD_S_AT_30HZ')
+    if np.max(np.abs(delta))>math.radians(POLICY['chunk_arm_excursion_deg']):reasons.append('CHUNK_ARM_EXCURSION_GT_60DEG')
+    lo=np.asarray(envelope['lower'],dtype=float);hi=np.asarray(envelope['upper'],dtype=float)
+    if lo.shape!=(7,) or hi.shape!=(7,) or not np.isfinite(lo).all() or not np.isfinite(hi).all() or np.any(lo>=hi):
+        raise ValueError('Invalid recorded-data envelope')
+    # Recorded envelope is a distribution check, not a hardware-limit claim.
+    if np.any(arm<lo[:6]) or np.any(arm>hi[:6]):reasons.append('ARM_OUTSIDE_RECORDED_DATA_ENVELOPE')
+    if np.any(a[:,6]<lo[6]) or np.any(a[:,6]>hi[6]):reasons.append('GRIPPER_OUTSIDE_RECORDED_DATA_ENVELOPE')
+    if abs(a[0,6]-q[6])>POLICY['first_gripper_jump_native']:reasons.append('FIRST_GRIPPER_JUMP_GT_0.15_NATIVE')
+    if np.max(np.abs(np.diff(a[:,6])))>POLICY['adjacent_gripper_jump_native']:reasons.append('ADJACENT_GRIPPER_JUMP_GT_0.10_NATIVE')
+    if np.max(np.abs(a[:,6]-q[6]))>POLICY['chunk_gripper_excursion_native']:reasons.append('CHUNK_GRIPPER_EXCURSION_GT_1.5_NATIVE')
+    limits=sdk_arm_limits() if arm_limits is None else arm_limits
+    vendor_lo=np.asarray(limits['lower']);vendor_hi=np.asarray(limits['upper'])
+    if vendor_lo.shape!=(6,) or vendor_hi.shape!=(6,) or not np.isfinite(vendor_lo).all() or not np.isfinite(vendor_hi).all() or np.any(vendor_lo>=vendor_hi):
+        raise ValueError('Invalid vendor SDK bounds')
+    outside=np.argwhere((arm<vendor_lo)|(arm>vendor_hi))
+    if len(outside):reasons.append('TARGET_OUTSIDE_VENDOR_SDK_ARM_BOUNDS_HANDLED_BY_SDK')
+    return dict(passed=True,reasons=[],warnings=reasons,
+        profile=PROFILE,vendor_sdk_arm_bounds=limits,
+        sdk_arm_limit_handling=POLICY['arm_limit_handling'],
+        sdk_arm_limit_events=[dict(step=int(i)+1,joint=int(j)+1,raw_target_rad=float(arm[i,j]),
+            sdk_saturated_target_rad=float(min(max(arm[i,j],vendor_lo[j]),vendor_hi[j])))
+            for i,j in outside],
+        max_nominal_adjacent_speed_rad_s=float(nominal_speed.max()),**describe(a,q))
+
+
+def sdk_arm_tracking_reference(row,limits):
+    """SDK pre-interpolation goal for monitoring only, never an outgoing target."""
+    return [min(max(float(x),float(lo)),float(hi))
+            for x,lo,hi in zip(row[:6],limits['lower'],limits['upper'])]
+
+
+def send_one_chunk(actions,pump,check,send,clock,event):
+    """Injectable bounded scheduler: 50 targets, no catch-up bursts or extra goals."""
+    next_at=clock()
+    for index,row in enumerate(actions):
+        while True:
+            pump();check()
+            now=clock()
+            if now>=next_at:break
+        if now-next_at>.033:raise RuntimeError('Scheduling delay >33ms; no catch-up goals')
+        send(row,index)
+        event(dict(index=index,sent_monotonic_s=now,target=list(map(float,row))))
+        next_at=clock()+1/ACTION_HZ
+
+
+class OperatorFinished(Exception):
+    """Operator reports completion; this is not an automatic success detector."""
+
+
+def terminal_completion_requested(stream):
+    if not stream.isatty():return False
+    if not select.select([stream],[],[],0)[0]:return False
+    return stream.readline()!=''  # Enter or any submitted line requests completion.
+
+
+def run_chunks(max_actions,acquire,execute,count,finish_requested):
+    """Fresh inference per chunk, never replay a prediction or exceed the budget."""
+    chunk=0
+    while count()<max_actions:
+        if finish_requested():raise OperatorFinished()
+        chunk+=1
+        actions=acquire(chunk)
+        remaining=max_actions-count()
+        execute(actions[:min(HORIZON,remaining)],chunk)
+    return chunk
+
+
+def main(default_max_actions=50):
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--execute',action='store_true')
+    parser.add_argument('--confirm-clear',action='store_true',help='Operator onsite; entire task workspace clear, gripper empty, power cutoff available')
+    parser.add_argument('--url',default='http://127.0.0.1:8765')
+    parser.add_argument('--sdk-log',type=Path,required=True)
+    parser.add_argument('--max-actions',type=int,choices=(50,500),default=default_max_actions,
+        help='total published-target budget; each new chunk uses a fresh observation')
+    args=parser.parse_args()
+    if args.execute and not args.confirm_clear:parser.error('--execute requires explicit --confirm-clear')
+    if args.execute and args.max_actions>50 and not sys.stdin.isatty():
+        parser.error('500-step task requires a foreground terminal; Enter reports task complete')
+    if os.environ.get('ROS_DOMAIN_ID')!='85':raise RuntimeError('Requires ROS_DOMAIN_ID85')
+    prefix='model-trial50-' if args.max_actions==50 else 'model-task500-'
+    folder=HOST/'logs'/(prefix+datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ'))
+    folder.mkdir(parents=True,exist_ok=False)
+    print('LOG_DIRECTORY='+str(folder),flush=True)
+    summary=dict(status='PREPARING',commands_sent=0,execute_requested=args.execute,
+        operator_confirmed_workspace_clear=args.confirm_clear,requested_targets=args.max_actions,
+        nominal_action_hz=30,actions_modified=False,model_weights_changed=False,
+        trial_policy=POLICY,profile=PROFILE,physical_safety_certified=False,
+        completion_detection='operator_terminal_enter_only',task_success_verified=False,
+        replanning_chunk_size=HORIZON,chunks=[])
+    lock=(HOST/'logs/r5_model_command.lock').open('a')
+    fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    channel=None;node=None;executor=None;publisher=None;rclpy=None
+    latest=None;received=0.;invalid=False;raw={};last_goal=None;last_sdk_arm_reference=None
+    speed_watch=SustainedSpeedWatch();log_offset=0;log_tail=b'';log_identity=None;last_log_check=-1.
+    try:
+        binding=binding_preflight();summary['binding']=binding
+        arm_limits=sdk_arm_limits();summary['vendor_sdk_arm_bounds']=arm_limits
+        proc_identity=sdk_identity(binding)
+        service=server_health(args.url)
+        if service.get('step')!=4000:raise RuntimeError('Expected original4k model')
+        summary['service']=service
+        import rclpy
+        from rclpy.qos import qos_profile_sensor_data
+        from arx5_arm_msg.msg import RobotCmd,RobotStatus
+        from readonly_preview import PreviewNode
+        from monitor_first_sdk_test import fields
+        rclpy.init(args=[]);node=PreviewNode()
+        def status_callback(msg):
+            nonlocal latest,received,invalid
+            values,valid=fields(msg)
+            if not valid:invalid=True;return
+            latest=values;received=time.monotonic()
+        full_subscription=node.create_subscription(RobotStatus,STATUS,status_callback,qos_profile_sensor_data)
+        channel=socket.socket(socket.PF_CAN,socket.SOCK_RAW,socket.CAN_RAW)
+        channel.setsockopt(socket.SOL_SOCKET,socket.SO_RCVBUF,1048576)
+        channel.bind(('can1',));channel.setblocking(False)
+        with (folder/'can_feedback.jsonl').open('w') as raw_log,(folder/'feedback.jsonl').open('w') as feedback_log:
+            last_feedback_logged=0.
+            def pump():
+                nonlocal last_feedback_logged
+                if terminal_completion_requested(sys.stdin):raise OperatorFinished()
+                if not rclpy.ok():raise RuntimeError('ROS stopped')
+                rclpy.spin_once(node,timeout_sec=.001)
+                for _ in range(2000):
+                    try:frame=channel.recv(16)
+                    except BlockingIOError:break
+                    if len(frame)!=16:continue
+                    ident,length,payload=struct.unpack('=IB3x8s',frame)
+                    now=time.monotonic()
+                    raw_log.write(json.dumps(dict(t=now,can_id=ident,length=length,data=payload[:length].hex()))+'\n')
+                    if ident==0 and length>=6 and payload[0]&15 in IDS:
+                        raw[payload[0]&15]=(now,payload[0]>>4)
+                if latest is not None and received!=last_feedback_logged:
+                    feedback_log.write(json.dumps(dict(t=received,**latest))+'\n');last_feedback_logged=received
+            def check():
+                nonlocal log_offset,log_tail,log_identity,last_log_check
+                now=time.monotonic()
+                if invalid or node.invalid or latest is None or now-received>.2:raise RuntimeError('Missing/stale/invalid ROS feedback or image')
+                if any(i not in raw or now-raw[i][0]>.3 or raw[i][1]!=1 for i in IDS):raise RuntimeError('Missing/stale/abnormal raw CAN feedback')
+                if node.count_publishers(STATUS)!=1:raise RuntimeError('Expected one status publisher')
+                if node.count_publishers(COMMAND)!=(1 if publisher is not None else 0):raise RuntimeError('Competing command publisher')
+                if now-last_log_check>.1:
+                    for camera in ('camera_1','camera_2'):
+                        values=node.observations.buffers[camera]
+                        if not values or (time.monotonic_ns()-values[-1][2])>500_000_000:
+                            raise RuntimeError('Camera stream stale: '+camera)
+                    if sdk_identity(binding)!=proc_identity:
+                        raise RuntimeError('SDK process changed')
+                    with args.sdk_log.open('rb') as stream:
+                        st=os.fstat(stream.fileno());identity=(st.st_dev,st.st_ino)
+                        if log_identity is not None and (identity!=log_identity or st.st_size<log_offset):raise RuntimeError('SDK log replaced/truncated')
+                        log_identity=identity;stream.seek(log_offset)
+                        while True:
+                            b=stream.read(65536)
+                            if not b:break
+                            b=log_tail+b
+                            if any(marker in b for marker in ('电机掉线'.encode(),b'Segmentation fault')):raise RuntimeError('SDK fault logged')
+                            log_tail=b[-64:]
+                        log_offset=stream.tell()
+                    last_log_check=now
+                v=latest['joint_vel'][:6]
+                #if max(map(abs,v))>POLICY['instantaneous_feedback_speed_rad_s']:
+                #    raise RuntimeError('FEEDBACK_SPEED_GT_1RAD_S')
+                #speed_watch.check(v,now)
+                #if last_goal is not None:
+                    # Compare against the goal the SDK accepts, not an impossible
+                    # out-of-range raw request. This does NOT predict interpolation
+                    # or remove the existing tracking threshold.
+                    #if max(abs(q-g) for q,g in zip(latest['joint_pos'][:6],last_sdk_arm_reference))>.03:raise RuntimeError('TRACKING_ERROR_GT_0.03RAD')
+                    #if abs(latest['joint_pos'][6]-last_goal[6])>.25:raise RuntimeError('GRIPPER_TRACKING_ERROR_GT_0.25_NATIVE')
+            executor=ThreadPoolExecutor(max_workers=1)
+            previous_anchor=None
+            pending=None
+            def acquire(chunk):
+                nonlocal previous_anchor,publisher,pending
+                obs=None;deadline=time.monotonic()+10
+                while time.monotonic()<deadline:
+                    pump()
+                    try:candidate=node.observations.latest()
+                    except ValueError:continue
+                    anchor=candidate['stamps']['camera_1_header_ns']
+                    if previous_anchor is not None and anchor<=previous_anchor:continue
+                    if latest is not None and set(raw)==IDS:obs=candidate;break
+                if obs is None:raise RuntimeError('No fresh synchronized live observation')
+                previous_anchor=anchor
+                check()
+                if chunk==1 and np.max(np.abs(np.array(latest['joint_pos'][:6])-np.array(TARGET)))>math.radians(5):
+                    summary['start_pose_warning']='NOT_NEAR_REFERENCE_START'
+                    print('WARNING: not near recorded start; no automatic reposition',flush=True)
+                print('REQUESTING_FRESH_CHUNK',chunk,'total_sent=',summary['commands_sent'],flush=True)
+                future=executor.submit(infer,args.url,obs,f'r5-task-{chunk}-{time.time_ns()}')
+                deadline=time.monotonic()+30
+                while not future.done():
+                    pump();check()
+                    if time.monotonic()>deadline:raise RuntimeError('Inference timeout')
+                actions,response=future.result();current=np.array(latest['joint_pos'],dtype=float)
+                if response.get('step')!=4000:raise RuntimeError('Prediction came from a different checkpoint')
+                response.update(source_stamps=obs['stamps'],observation_state=obs['state'].tolist(),
+                    current_feedback=current.tolist(),actions_modified=False)
+                chunk_folder=folder/'chunks'/f'chunk_{chunk:04d}'
+                write(chunk_folder/'prediction.json',response)
+                if chunk==1:write(folder/'prediction.json',response)
+                if (time.monotonic_ns()-obs['selected_received_monotonic_ns'])/1e9>2.:
+                    raise RuntimeError('Observation >2s old after inference')
+                #if np.max(np.abs(current[:6]-obs['state'][:6]))>.005 or abs(current[6]-obs['state'][6])>.05:
+                #    raise RuntimeError('Robot changed during inference; no old predictions executed')
+                envelope=json.loads(Path(__file__).with_name('guard_profile.json').read_text())
+                validation=validate_chunk(actions,current,envelope,arm_limits)
+                write(chunk_folder/'validation.json',validation)
+                if chunk==1:write(folder/'validation.json',validation)
+                print('CHUNK_CHECK',chunk,json.dumps(validation,ensure_ascii=False),flush=True)
+                if not validation['passed']:raise RuntimeError('CHUNK_REJECTED: '+','.join(validation['reasons']))
+                pending=dict(chunk=chunk,source_stamps=obs['stamps'],sent_before=summary['commands_sent'],
+                    commands_sent=0,status='VALIDATED')
+                summary['chunks'].append(pending)
+                if not args.execute:return actions
+                if binding_preflight()!=binding:raise RuntimeError('Binding changed during inference')
+                if publisher is None:publisher=node.create_publisher(RobotCmd,COMMAND,1)
+                deadline=time.monotonic()+2
+                while publisher.get_subscription_count()==0 and time.monotonic()<deadline:pump();check()
+                if publisher.get_subscription_count()!=1:raise RuntimeError('Expected exactly one command subscriber')
+                if (time.monotonic_ns()-obs['selected_received_monotonic_ns'])/1e9>2.:
+                    raise RuntimeError('Prediction aged before execution')
+                check()
+                if np.max(np.abs(np.array(latest['joint_pos'][:6])-current[:6]))>.005:
+                    raise RuntimeError('Start pose changed before execution')
+                return actions
+            print('TASK_BUDGET',args.max_actions,'TARGETS; Enter reports task complete; NOT an emergency stop',flush=True)
+            if not args.execute:
+                acquire(1);summary['status']='DRY_RUN_VALIDATED_NO_COMMANDS';return
+            with (folder/'commands.jsonl').open('w') as command_log:
+                def execute_chunk(actions,chunk):
+                    def send(row,index):
+                        nonlocal last_goal,last_sdk_arm_reference
+                        if summary['commands_sent']>=args.max_actions:raise RuntimeError('Action budget exhausted')
+                        msg=RobotCmd();msg.header.stamp=node.get_clock().now().to_msg()
+                        msg.joint_pos=[float(x) for x in row[:6]];msg.gripper=float(row[6])
+                        msg.end_pos=list(latest['end_pos']);msg.mode=5
+                        publisher.publish(msg);last_goal=list(map(float,row))
+                        last_sdk_arm_reference=sdk_arm_tracking_reference(row,arm_limits)
+                        summary['commands_sent']+=1;pending['commands_sent']+=1
+                        print('TARGET_SENT',summary['commands_sent'],'/',args.max_actions,'chunk=',chunk,flush=True)
+                    def event(value):
+                        value.update(chunk=chunk,total_sent=summary['commands_sent'],
+                            sdk_arm_tracking_reference_rad=last_sdk_arm_reference,feedback=latest)
+                        command_log.write(json.dumps(value)+'\n');command_log.flush()
+                    pending['status']='EXECUTING'
+                    send_one_chunk(actions,pump,check,send,time.monotonic,event)
+                    pending['status']='SENT'
+                    write(folder/'summary.json',summary)
+                run_chunks(args.max_actions,acquire,execute_chunk,lambda:summary['commands_sent'],
+                    lambda:terminal_completion_requested(sys.stdin))
+            deadline=time.monotonic()+1
+            while time.monotonic()<deadline:pump();check()
+            status='SENT_50_TARGETS_FEEDBACK_OBSERVED' if args.max_actions==50 else 'ACTION_LIMIT_REACHED'
+            summary.update(status=status,final_feedback=latest)
+            print(status,'total_sent=',summary['commands_sent'],'SDK retains last target; no reset.',flush=True)
+    except OperatorFinished:
+        summary.update(status='OPERATOR_REPORTED_TASK_COMPLETE',operator_reported_success=True,
+            final_feedback=latest)
+        print('OPERATOR_REPORTED_TASK_COMPLETE; no further targets; SDK may retain last target. NOT an emergency stop.',flush=True)
+    except KeyboardInterrupt:
+        summary.update(status='OPERATOR_INTERRUPTED',operator_reported_success=False,final_feedback=latest)
+        print('OPERATOR_INTERRUPTED; no further targets; SDK may retain last target. NOT an emergency stop.',flush=True)
+    except BaseException as exc:
+        summary.update(status='ABORTED',error=repr(exc),last_goal=last_goal,
+            last_sdk_arm_tracking_reference=last_sdk_arm_reference,last_feedback=latest)
+        print('ABORTED',repr(exc),'No further targets. SDK may retain last target; this is NOT an emergency stop.',flush=True)
+        raise
+    finally:
+        write(folder/'summary.json',summary)
+        if executor is not None:executor.shutdown(wait=True,cancel_futures=True)
+        if channel is not None:channel.close()
+        if node is not None:node.destroy_node()
+        if rclpy is not None and rclpy.ok():rclpy.shutdown()
+        lock.close()
+
+
+if __name__=='__main__':main()

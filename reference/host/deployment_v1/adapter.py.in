@@ -1,0 +1,110 @@
+"""Use upstream LingBot inference and its real transform with an explicit R5 inverse."""
+import copy
+import os
+from pathlib import Path
+import sys
+import time
+from types import SimpleNamespace
+import numpy as np
+import yaml
+from contract import TRAIN,SOURCE,NORM_SHA,TASK,ARM_INDEX,GRIP_INDEX,image256,digest,read
+
+
+def settings():
+    c=yaml.safe_load((TRAIN/'output/lingbotvla_cli.yaml').read_text())
+    assert c['train']['max_steps']==4000 and c['train']['chunk_size']==50
+    assert digest(TRAIN/'normalization_stats.json')==NORM_SHA
+    assert c['data']['cameras']==['camera_top','camera_wrist_left']
+    return c
+
+
+def transform_and_dataset():
+    sys.path.insert(0,str(SOURCE))
+    import torch
+    from transformers import AutoProcessor
+    from lingbotvla.models.vla.lingbot_vla.configuration_lingbot_vla import LingbotVLAV2Config
+    from lingbotvla.data.vla_data.base_dataset import VLADataset
+    c=settings()
+    config=LingbotVLAV2Config(**{**c['model'],**c['train']})
+    processor=AutoProcessor.from_pretrained(c['model']['tokenizer_path'],trust_remote_code=True,local_files_only=True)
+    ds=VLADataset(str(TRAIN/'dataset'),'r5_follower',SimpleNamespace(**c['data']),
+        str(TRAIN/'robot_configs'),config,processor,chunk_size=50,image_size=(256,256))
+    return ds.feature_transform,ds
+
+
+def prepare(ft,state,camera_1,camera_2):
+    import torch
+    raw={'observation.state':torch.from_numpy(np.asarray(state,np.float32).copy()),'task':TASK}
+    for name,image in (('camera_1',camera_1),('camera_2',camera_2)):
+        raw['observation.images.'+name]=torch.from_numpy(image256(image)).permute(2,0,1).contiguous()
+    return ft.apply(raw,policy_eval=True)
+
+
+def decode(ft,transformed,normalized):
+    import torch
+    values=torch.as_tensor(normalized,dtype=torch.float32,device='cpu')
+    assert values.shape==(50,55) and torch.isfinite(values).all()
+    # reverse_features() reconstructs current+50 future states for state-derived
+    # actions. Inverse only the action blocks so the wire result is exactly50x7.
+    parts=ft.normalizer.unnormalize({
+        'action.arm.position':values[:,ARM_INDEX],
+        'action.effector.position':values[:,GRIP_INDEX:GRIP_INDEX+1]})
+    result=torch.cat([parts['action.arm.position'],parts['action.effector.position']],dim=-1).float()
+    assert result.shape==(50,7) and torch.isfinite(result).all()
+    mask=transformed['action_joint_mask'].bool()
+    assert torch.equal(torch.where(mask)[0],torch.tensor(ARM_INDEX+[GRIP_INDEX]))
+    return result.numpy()
+
+
+class R5Policy:
+    def __init__(self,step):
+        import torch
+        sys.path.insert(0,str(SOURCE))
+        from deploy.lingbot_vla_v2_policy import LingbotVLAv2Server
+        from lingbotvla.data.vla_data.utils import FeatureTransform
+        assert step in (2000,4000)
+        ready=read(TRAIN/'output'/f'CHECKPOINT_READY_STEP_{step}.json')
+        self.checkpoint=Path(ready['hf_checkpoint'])
+        assert self.checkpoint==TRAIN/'output/checkpoints'/f'global_step_{step}'/'hf_ckpt'
+        c=settings();self.step=step
+        norm=TRAIN/'normalization_stats.json'
+        assert ready['normalization_sha256']==digest(norm)==NORM_SHA
+        self.wrapper=LingbotVLAv2Server(str(self.checkpoint),robot_norm_path=str(norm),
+            use_length=50,chunk_ret=True,use_bf16=True,use_fp32=False,use_compile=False)
+        self.ft=FeatureTransform(str(TRAIN/'robot_configs/r5_follower.yaml'),
+            self.wrapper.data_config,self.wrapper.config,self.wrapper.processor,
+            chunk_size=50,norm_stats_path=str(norm))
+        self.wrapper.vla.feature_transform=self.ft
+        self.wrapper.vla.model.config.num_steps=10
+        assert self.wrapper.vla.model.config.use_cache
+        self.wrapper.vla.eval()
+        self.velocity_calls=0
+        original_velocity=self.wrapper.vla.model.predict_velocity
+        def counted_velocity(*args,**kwargs):
+            self.velocity_calls+=1
+            return original_velocity(*args,**kwargs)
+        self.wrapper.vla.model.predict_velocity=counted_velocity
+        self.load_evidence=dict(strict=True,checkpoint=str(self.checkpoint),step=step,
+            normalization_sha256=digest(norm),prediction_steps=50,configured_denoising_steps=10,
+            dtype='bfloat16',action_representation='absolute joint radians plus native gripper',
+            auxiliary_branches_enabled=False)
+
+    def infer(self,state,camera_1,camera_2,seed=None):
+        import torch
+        if seed is not None:
+            torch.manual_seed(seed);torch.cuda.manual_seed_all(seed)
+        start=time.perf_counter()
+        self.velocity_calls=0
+        transformed=prepare(self.ft,state,camera_1,camera_2)
+        tensors={k:v.unsqueeze(0) for k,v in transformed.items() if isinstance(v,torch.Tensor)}
+        torch.cuda.synchronize();before=time.perf_counter()
+        with torch.inference_mode():
+            normalized=self.wrapper.vla.sample_actions_batch(tensors,use_bf16=True,
+                use_compile=False,sample_compile_fn=self.wrapper.sample_actions_fn)
+        torch.cuda.synchronize();after=time.perf_counter()
+        normalized=normalized[0].float().cpu()
+        actions=decode(self.ft,transformed,normalized)
+        return actions,dict(total_ms=(time.perf_counter()-start)*1000,
+            model_ms=(after-before)*1000,preprocess_ms=(before-start)*1000,
+            actual_velocity_evaluations=self.velocity_calls,
+            cuda_peak_allocated_GiB=torch.cuda.max_memory_allocated()/1024**3),normalized.numpy()

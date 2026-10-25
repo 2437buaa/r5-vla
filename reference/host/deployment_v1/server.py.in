@@ -1,0 +1,42 @@
+"""SSH-tunnel-only R5 inference service. This process cannot access ROS or CAN."""
+import argparse
+from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
+import json
+import threading
+from contract import PROTOCOL,NORM_SHA,HORIZON,ACTION_HZ,request,unpack_request,read,write
+from adapter import R5Policy
+
+
+def main():
+    parser=argparse.ArgumentParser();parser.add_argument('--step',type=int,choices=[2000,4000],default=4000)
+    parser.add_argument('--port',type=int,default=18765)
+    args=parser.parse_args();policy=R5Policy(args.step);lock=threading.Lock()
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path!='/healthz':self.send_error(404);return
+            self.reply(dict(status='READY',protocol=PROTOCOL,step=args.step,
+                            normalization_sha256=NORM_SHA,motion_capability=False))
+        def reply(self,value):
+            body=json.dumps(value,allow_nan=False).encode()
+            self.send_response(200);self.send_header('Content-Type','application/json')
+            self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
+        def do_POST(self):
+            if self.path!='/infer':self.send_error(404);return
+            try:
+                length=int(self.headers.get('Content-Length','0'))
+                if not 0<length<=2_000_000:raise ValueError('payload size')
+                value=json.loads(self.rfile.read(length));obs=unpack_request(value)
+                if not lock.acquire(blocking=False):self.send_error(503,'inference busy');return
+                try:
+                    actions,timing,_=policy.infer(obs['state'],obs['camera_1'],obs['camera_2'])
+                finally:lock.release()
+                self.reply(dict(protocol=PROTOCOL,request_id=value['request_id'],step=args.step,
+                    normalization_sha256=NORM_SHA,action_hz=ACTION_HZ,horizon=HORIZON,
+                    actions=actions.tolist(),timing=timing,source_stamps=value.get('source_stamps',{})))
+            except Exception as exc:
+                self.send_error(400,str(exc))
+    print(f'R5_SERVER_READY host=127.0.0.1 port={args.port} step={args.step}',flush=True)
+    ThreadingHTTPServer(('127.0.0.1',args.port),Handler).serve_forever()
+
+
+if __name__=='__main__':main()

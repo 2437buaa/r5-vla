@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Foreground operator-run task; never initializes or restarts a robot SDK.
+set -euo pipefail
+R5_TASK_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+exec bash "$R5_TASK_DIR/trial50.sh" --max-actions 500 "$@"

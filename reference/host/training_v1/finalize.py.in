@@ -1,0 +1,21 @@
+"""Require both ranks and a complete final HF export before claiming completion."""
+from pathlib import Path
+import sys
+from common import read, write, sha
+
+b=Path(sys.argv[1]); out=b/'output'
+for rank in range(2):
+    assert read(out/'completion'/f'rank_{rank}.json')['global_step']==4000
+    assert read(out/'normalization_proof'/f'rank_{rank}.json')['verified']
+    assert read(out/'forward_backward_pass'/f'rank_{rank}.json')['status']=='PASS'
+    assert read(out/'base_load_proof'/f'rank_{rank}.json')['verified']
+cp=out/'checkpoints/global_step_4000'
+idx=read(cp/'hf_ckpt/model.safetensors.index.json')
+for name in set(idx['weight_map'].values()):
+    assert (cp/'hf_ckpt'/name).stat().st_size>1000000
+for folder in ('model','optimizer','extra_state'):
+    assert list((cp/folder).iterdir())
+write(out/'FINAL_ACCEPTANCE.json',dict(status='PASS',global_step=4000,
+    hf_checkpoint=str(cp/'hf_ckpt'),normalization=str(b/'normalization_stats.json'),
+    normalization_sha256=sha(b/'normalization_stats.json'),real_robot_deployment_tested=False))
+print('R5_TRAINING_COMPLETE',cp,flush=True)

@@ -1,0 +1,35 @@
+"""Configuration-only vendor SDK launch; both hardware nodes default OFF.
+
+No custom motion algorithm, speed threshold, bridge, or gripper remapping.
+Enabling either node can enable/home the corresponding arm. Enabling master
+requests vendor gravity compensation. Enabling follower can immediately follow
+the master pose AND the unvalidated vendor gripper mapping. See README.
+"""
+from pathlib import Path
+
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, LogInfo, SetEnvironmentVariable
+from launch.conditions import IfCondition
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node
+
+CONFIG = Path(__file__).resolve().parents[1] / 'config' / 'one_master_one_slave.yaml'
+
+
+def generate_launch_description():
+    return LaunchDescription([
+        DeclareLaunchArgument('enable_master', default_value='false',
+                              description='Real enable/homing and gravity compensation; default OFF'),
+        DeclareLaunchArgument('enable_follower', default_value='false',
+                              description='Real enable/homing and following including gripper; default OFF'),
+        SetEnvironmentVariable('ROS_DOMAIN_ID', '85'),
+        SetEnvironmentVariable('ROS_LOCALHOST_ONLY', '1'),
+        LogInfo(msg='ONE MASTER / ONE FOLLOWER configuration. Both nodes default OFF. '
+                    'No physical compatibility certification; read ONE_MASTER_ONE_SLAVE.md first.'),
+        Node(package='arx_r5_controller', executable='R5Controller', name='r5_pair_master',
+             output='screen', parameters=[str(CONFIG)],
+             condition=IfCondition(LaunchConfiguration('enable_master'))),
+        Node(package='arx_r5_controller', executable='R5Controller', name='r5_pair_follower',
+             output='screen', parameters=[str(CONFIG)],
+             condition=IfCondition(LaunchConfiguration('enable_follower'))),
+    ])

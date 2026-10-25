@@ -1,0 +1,81 @@
+"""Live original-model predictions only: NO command publisher, SDK or CAN access.
+
+Unlike readonly_preview.py, this entry point never calls trajectory_guard or
+produces smoothed/clipped actions. Predictions are NOT hardware execution permits.
+"""
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime,timezone
+from pathlib import Path
+import time
+import numpy as np
+from client import health,infer
+from contract import write
+
+
+def describe(actions,state):
+    a=np.asarray(actions,dtype=np.float32);q=np.asarray(state,dtype=np.float32)
+    if a.shape!=(50,7) or q.shape!=(7,) or not np.isfinite(a).all() or not np.isfinite(q).all():
+        raise ValueError('Finite 50x7 actions and 7D state required')
+    return dict(first_target_delta_deg=np.rad2deg(a[0,:6]-q[:6]).tolist(),
+        max_chunk_excursion_deg=np.rad2deg(np.max(np.abs(a[:,:6]-q[:6]),axis=0)).tolist(),
+        max_adjacent_target_step_deg=np.rad2deg(np.max(np.abs(np.diff(a[:,:6],axis=0)),axis=0)).tolist(),
+        gripper_current_native=float(q[6]),gripper_first_target_native=float(a[0,6]),
+        gripper_target_range_native=[float(a[:,6].min()),float(a[:,6].max())],
+        actions_modified=False,motor_commands_sent=False,hardware_execution_eligible=False)
+
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--url',default='http://127.0.0.1:8765')
+    parser.add_argument('--samples',type=int,default=3)
+    args=parser.parse_args()
+    if not 1<=args.samples<=10:parser.error('samples must be1..10')
+    metadata=health(args.url)
+    if metadata.get('step')!=4000:raise ValueError('Expected original step4000 model')
+    import rclpy
+    from readonly_preview import PreviewNode
+    folder=Path(__file__).resolve().parent.parent/'logs'/('raw-model-preview-'+datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ'))
+    folder.mkdir(parents=True,exist_ok=False)
+    write(folder/'metadata.json',dict(server=metadata,motor_commands_sent=False,
+        actions_modified=False,command_publisher_created=False,hardware_execution_eligible=False))
+    print('RAW_PREVIEW_ONLY: no movement, no filtering. LOG_DIRECTORY='+str(folder),flush=True)
+    rclpy.init(args=[]);node=PreviewNode();executor=ThreadPoolExecutor(max_workers=1)
+    pending=None;obs=None;count=0;next_at=0.;last_stamp=-1;last_wait=0.;start=time.monotonic()
+    try:
+        while rclpy.ok() and count<args.samples and time.monotonic()-start<60:
+            rclpy.spin_once(node,timeout_sec=.005)
+            if pending is not None and pending.done():
+                actions,response=pending.result();pending=None
+                current,age,stamp=node.observations.feedback_snapshot(max_age_s=.2)
+                response.update(observation_state=obs['state'].tolist(),
+                    current_feedback=current.tolist(),feedback_age_s=age,feedback_header_ns=stamp,
+                    source_stamps=obs['stamps'],summary=describe(actions,current),
+                    actions_modified=False,motor_commands_sent=False)
+                count+=1;write(folder/f'prediction_{count:04d}.json',response)
+                print('RAW_PREDICTION',count,'roundtrip_ms=',round(response['client_roundtrip_ms'],1),
+                    'first_delta_deg=',[round(x,2) for x in response['summary']['first_target_delta_deg']],
+                    'chunk_excursion_deg=',[round(x,2) for x in response['summary']['max_chunk_excursion_deg']],
+                    'gripper_native=',response['summary']['gripper_target_range_native'],flush=True)
+                next_at=time.monotonic()+50/30
+            if pending is None and time.monotonic()>=next_at and count<args.samples:
+                try:
+                    candidate=node.observations.latest()
+                    if candidate['stamps']['camera_1_header_ns']<=last_stamp:continue
+                    obs=candidate;last_stamp=obs['stamps']['camera_1_header_ns']
+                    pending=executor.submit(infer,args.url,obs,f'raw-{time.time_ns()}')
+                except ValueError as exc:
+                    if time.monotonic()-last_wait>3:
+                        print('WAITING_FOR_OBSERVATION',str(exc),flush=True);last_wait=time.monotonic()
+        if count!=args.samples:raise RuntimeError('Did not complete all requested live predictions')
+        print('RAW_PREVIEW_COMPLETE; no motor commands were sent',flush=True)
+    finally:
+        executor.shutdown(wait=True,cancel_futures=True)
+        write(folder/'summary.json',dict(predictions=count,requested=args.samples,
+            motor_commands_sent=False,actions_modified=False,invalid_ros_messages=node.invalid,
+            hardware_execution_eligible=False))
+        node.destroy_node()
+        if rclpy.ok():rclpy.shutdown()
+
+
+if __name__=='__main__':main()

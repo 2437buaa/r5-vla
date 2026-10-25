@@ -1,0 +1,87 @@
+"""R5-only, explicit RGB/state/action wire contract. No robot command code."""
+import base64
+import hashlib
+import json
+from pathlib import Path
+import time
+import cv2
+import numpy as np
+
+PROTOCOL='r5-vla-preview-v1'
+TASK='Put the charger in the box'
+NORM_SHA='3f275d6a06931b34c790d8d9784ad57bc13e21b24d9059674bbc0aeb9803d022'
+TRAIN=Path('{{TRAIN_BUNDLE}}')
+SOURCE=Path('{{LINGBOT_SOURCE}}')
+ACTION_HZ=30
+HORIZON=50
+ARM_INDEX=list(range(6))
+GRIP_INDEX=28
+
+
+def write(path,value):
+    p=Path(path);p.parent.mkdir(parents=True,exist_ok=True)
+    q=p.with_name(p.name+'.tmp')
+    q.write_text(json.dumps(value,indent=2,ensure_ascii=False,allow_nan=False)+'\n');q.replace(p)
+
+
+def read(path):
+    return json.loads(Path(path).read_text())
+
+
+def digest(path):
+    h=hashlib.sha256()
+    with Path(path).open('rb') as stream:
+        for block in iter(lambda:stream.read(8*1024**2),b''):h.update(block)
+    return h.hexdigest()
+
+
+def image256(rgb):
+    a=np.asarray(rgb)
+    if a.dtype!=np.uint8 or a.ndim!=3 or a.shape[-1]!=3:
+        raise ValueError('RGB uint8 HWC image required')
+    if a.shape[:2] not in ((530,848),(256,256)):
+        raise ValueError(f'unreviewed camera resolution {a.shape}')
+    return a.copy() if a.shape[:2]==(256,256) else cv2.resize(a,(256,256),interpolation=cv2.INTER_AREA)
+
+
+def png(rgb):
+    a=image256(rgb)
+    ok,data=cv2.imencode('.png',cv2.cvtColor(a,cv2.COLOR_RGB2BGR),[cv2.IMWRITE_PNG_COMPRESSION,1])
+    if not ok:raise ValueError('PNG encoding failed')
+    return base64.b64encode(data).decode('ascii')
+
+
+def unpng(value):
+    if not isinstance(value,str) or len(value)>600000:raise ValueError('invalid image payload')
+    encoded=base64.b64decode(value,validate=True)
+    a=cv2.imdecode(np.frombuffer(encoded,np.uint8),cv2.IMREAD_COLOR)
+    if a is None or a.shape!=(256,256,3):raise ValueError('expected256x256 PNG')
+    return cv2.cvtColor(a,cv2.COLOR_BGR2RGB)
+
+
+def request(state,camera_1,camera_2,request_id,stamps=None):
+    q=np.asarray(state,dtype=np.float32)
+    if q.shape!=(7,) or not np.isfinite(q).all():raise ValueError('finite7-dimensional state required')
+    return dict(protocol=PROTOCOL,request_id=str(request_id),task=TASK,state=q.tolist(),
+        camera_1_png=png(camera_1),camera_2_png=png(camera_2),
+        normalization_sha256=NORM_SHA,source_stamps=stamps or {},client_wall_ns=time.time_ns())
+
+
+def unpack_request(value):
+    if value.get('protocol')!=PROTOCOL or value.get('task')!=TASK:raise ValueError('protocol/task mismatch')
+    if value.get('normalization_sha256')!=NORM_SHA:raise ValueError('normalization mismatch')
+    if not isinstance(value.get('request_id'),str) or len(value['request_id'])>120:raise ValueError('request_id required')
+    q=np.asarray(value['state'],dtype=np.float32)
+    if q.shape!=(7,) or not np.isfinite(q).all():raise ValueError('invalid state')
+    return dict(state=q,camera_1=unpng(value['camera_1_png']),camera_2=unpng(value['camera_2_png']))
+
+
+def response_actions(response,request_id):
+    if response.get('protocol')!=PROTOCOL or response.get('request_id')!=str(request_id):
+        raise ValueError('response association mismatch')
+    if response.get('normalization_sha256')!=NORM_SHA:raise ValueError('normalization mismatch')
+    if response.get('action_hz')!=30 or response.get('horizon')!=50:
+        raise ValueError('action clock/horizon mismatch')
+    a=np.asarray(response['actions'],dtype=np.float32)
+    if a.shape!=(50,7) or not np.isfinite(a).all():raise ValueError('expected finite50x7 actions')
+    return a

@@ -1,0 +1,290 @@
+"""Server CPU-only decoding, alignment, dataset construction and real reader checks."""
+import bisect
+import copy
+import csv
+import importlib.util
+import os
+from pathlib import Path
+import shutil
+import sys
+from types import SimpleNamespace
+
+import cv2
+import numpy as np
+import yaml
+
+from common import SOURCE, BASE, TASK, SESSIONS, CAMERAS, FOLLOWER, STEPS, read, write, sha
+
+
+def messages(path):
+    from mcap.reader import make_reader
+    from mcap_ros2.decoder import DecoderFactory
+    with path.open('rb') as f:
+        reader = make_reader(f, decoder_factories=[DecoderFactory()])
+        for _, channel, raw, msg in reader.iter_decoded_messages(
+                topics=CAMERAS + [FOLLOWER], log_time_order=True):
+            t = int(msg.header.stamp.sec) * 10**9 + int(msg.header.stamp.nanosec)
+            yield channel.topic, t, raw.log_time, msg
+
+
+def decode(folder):
+    meta = read(folder / 'episode.json')
+    assert meta['label'] == 'success' and not meta['test_only'] and meta['task'] == TASK
+    assert meta['recorder_exit_code'] == 0 and not meta['forced_shutdown']
+    assert meta['bag_structurally_complete'] and meta['subscriptions_ready']
+    stamps = {k: [] for k in CAMERAS + [FOLLOWER]}
+    images = {k: [] for k in CAMERAS}
+    states = []
+    for topic, t, _, msg in messages(folder / 'raw/bag/bag_0.mcap'):
+        assert not stamps[topic] or t > stamps[topic][-1], ('non-increasing header', topic)
+        stamps[topic].append(t)
+        if topic == FOLLOWER:
+            assert len(msg.joint_pos) == 7
+            states.append(list(msg.joint_pos))
+        else:
+            assert (msg.height, msg.width, msg.encoding) == (530, 848, 'rgb8')
+            rgb = np.frombuffer(bytes(msg.data), np.uint8).reshape(msg.height, msg.step)
+            rgb = rgb[:, :msg.width * 3].reshape(msg.height, msg.width, 3)
+            assert rgb.std() > 1, 'blank camera frame'
+            images[topic].append(cv2.resize(rgb, (256, 256), interpolation=cv2.INTER_AREA))
+    assert all(len(v) >= 60 for v in stamps.values())
+    for topic, ts in stamps.items():
+        assert len(ts) == meta['topic_message_counts'][topic], ('metadata count mismatch', topic)
+    q = np.asarray(states, dtype=np.float64)
+    assert np.isfinite(q).all()
+    begin, end = max(v[0] for v in stamps.values()), min(v[-1] for v in stamps.values())
+    selected = [(i, t) for i, t in enumerate(stamps[CAMERAS[0]])
+                if begin < t < end]
+    assert len(selected) >= 60
+    assert max(np.diff([t for _, t in selected])) <= 50_000_000, 'RGB anchor gap >50ms'
+    state, paired, timeline = [], [], []
+    last_j = -1
+    for i, t in selected:
+        j = bisect.bisect_left(stamps[CAMERAS[1]], t)
+        j = min((a for a in (j - 1, j) if 0 <= a < len(stamps[CAMERAS[1]])),
+                key=lambda a: abs(stamps[CAMERAS[1]][a] - t))
+        offset = stamps[CAMERAS[1]][j] - t
+        assert abs(offset) <= 16_700_000, 'camera pair offset >16.7ms'
+        assert j > last_j, 'camera reuse or reordering'
+        last_j = j
+        hi = bisect.bisect_left(stamps[FOLLOWER], t)
+        assert 0 < hi < len(q)
+        lo = hi - 1
+        gap = stamps[FOLLOWER][hi] - stamps[FOLLOWER][lo]
+        assert 0 < gap <= 10_000_000, 'state gap >10ms'
+        alpha = (t - stamps[FOLLOWER][lo]) / gap
+        value = q[lo] * (1 - alpha) + q[hi] * alpha
+        value[6] = q[lo, 6]
+        state.append(value)
+        paired.append((i, j))
+        timeline.append(dict(frame=len(state) - 1, camera_1_header_ns=t,
+            camera_2_header_ns=stamps[CAMERAS[1]][j], camera_offset_ms=offset / 1e6,
+            follower_before_ns=stamps[FOLLOWER][lo], follower_after_ns=stamps[FOLLOWER][hi],
+            state_bracket_ms=gap / 1e6, nominal_seconds=(len(state) - 1) / 30))
+    for c in (0, 1):
+        ts = [stamps[CAMERAS[c]][ij[c]] for ij in paired]
+        assert max(np.diff(ts)) <= 50_000_000, 'selected camera gap >50ms'
+    real = (timeline[-1]['camera_1_header_ns'] - timeline[0]['camera_1_header_ns']) / 1e9
+    drift = max(abs(r['nominal_seconds'] - (r['camera_1_header_ns'] - timeline[0]['camera_1_header_ns']) / 1e9)
+                for r in timeline)
+    assert drift <= .050, ('30Hz clock approximation exceeds50ms', drift)
+    report = dict(frames=len(state), measured_fps=(len(state) - 1) / real,
+        camera_offset_ms_max=max(abs(r['camera_offset_ms']) for r in timeline),
+        state_bracket_ms_max=max(r['state_bracket_ms'] for r in timeline),
+        nominal_clock_error_ms_max=drift * 1000, raw_counts={k: len(v) for k, v in stamps.items()})
+    return np.asarray(state, np.float32), images, paired, timeline, report
+
+
+def stats(values):
+    out = {k: fn(values, axis=0).tolist() for k, fn in
+           [('mean', np.mean), ('std', np.std), ('min', np.min), ('max', np.max)]}
+    for name, p in [('q01', .01), ('q99', .99), ('q02', .02), ('q98', .98)]:
+        out[name] = np.quantile(values, p, axis=0).tolist()
+    assert np.all(np.asarray(out['q99']) - out['q01'] > 1e-5), 'degenerate normalization'
+    return out
+
+
+def config(bundle):
+    template = Path('{{TRAIN_CONFIG_TEMPLATE}}')
+    c = yaml.safe_load(template.read_text())
+    c['model'].update(model_path=str(BASE), config_path=str(BASE))
+    c['data'].update(train_path=str(bundle / 'train.txt'), robot_config_root=str(bundle / 'robot_configs'),
+        norm_stats_file=str(bundle / 'normalization_stats.json'), cameras=['camera_top', 'camera_wrist_left'],
+        image_augment=False, img_size=256, num_workers=2, prefetch_factor=1, use_future_image=False)
+    c['train'].update(output_dir=str(bundle / 'output'), max_steps=STEPS, num_train_epochs=10000,
+        micro_batch_size=8, global_batch_size=32, gradient_accumulation_steps=2,
+        data_parallel_replicate_size=1, data_parallel_shard_size=2,
+        enable_resume=False, load_checkpoint_path=None, resume_dataloader_state=False,
+        save_steps=1500, save_epochs=0, save_hf_weights=True, async_save_hf_weights=False,
+        optimizer='adamw', lr=5e-5, lr_min=2.5e-5, lr_warmup_ratio=.03333333333333333,
+        enable_full_shard=True, enable_gradient_checkpointing=True, enable_mixed_precision=True,
+        enable_fp32=False, use_compile=False, align_params={}, use_wandb=False,
+        freeze_vit=False, freeze_vision_encoder=False, train_expert_only=False,
+        moe_monitor_interval=100, empty_cache_steps=500)
+    c['eval'] = {'enabled': False}
+    robot = dict(states=[
+        {'observation.state.arm.position': {'origin_keys': [{'observation.state': {'start': 0, 'end': 6}}]}},
+        {'observation.state.effector.position': {'origin_keys': [{'observation.state': {'start': 6, 'end': 7}}]}}],
+        actions=[{'action.arm.position': {'convert_from_state': True, 'subtract_state': False}},
+                 {'action.effector.position': {'convert_from_state': True, 'subtract_state': False}}],
+        images=[{'observation.images.camera_top': {'origin_keys': 'observation.images.camera_2'}},
+                {'observation.images.camera_wrist_left': {'origin_keys': 'observation.images.camera_1'}}],
+        norm_stats=str(bundle / 'normalization_stats.json'))
+    (bundle / 'robot_configs').mkdir()
+    (bundle / 'robot_configs/r5_follower.yaml').write_text(yaml.safe_dump(robot, sort_keys=False))
+    (bundle / 'train.yaml').write_text(yaml.safe_dump(c, sort_keys=False))
+    (bundle / 'train.txt').write_text(f'r5_follower {bundle / "dataset"}\n')
+    write(bundle / 'deployment_contract.json', dict(action_hz=30, prediction_steps=50,
+        execution_steps_default=50, execution_steps_options=[10, 25, 50],
+        action_representation='absolute six joint radians + native gripper',
+        gripper_endpoint_calibration='not inferred from grasped-object closure; native units preserved',
+        cameras={'camera_top': 'camera_2 external', 'camera_wrist_left': 'camera_1 follower wrist'},
+        model_bridge_implemented=False))
+    return c
+
+
+def reader_checks(bundle, all_states, records):
+    os.environ.update(WORLD_SIZE='2', RANK='0', LOCAL_RANK='0', LOCAL_WORLD_SIZE='2')
+    sys.path.insert(0, str(SOURCE))
+    import torch
+    from transformers import AutoProcessor
+    from lingbotvla.data.vla_data.base_dataset import VLADataset
+    from lingbotvla.data.vla_data.utils import FeatureTransform
+    from lingbotvla.models.vla.lingbot_vla.configuration_lingbot_vla import LingbotVLAV2Config
+    from lingbotvla.utils.arguments import parse_args
+    spec = importlib.util.spec_from_file_location('r5_official_training', SOURCE / 'tasks/vla/train_lingbotvla.py')
+    mod = importlib.util.module_from_spec(spec); sys.modules[spec.name] = mod; spec.loader.exec_module(mod)
+    sys.argv = [str(spec.origin), str(bundle / 'train.yaml')]
+    args = parse_args(mod.Arguments)
+    assert args.train.data_parallel_size == 2 and args.train.dataloader_batch_size == 16
+    model_config = LingbotVLAV2Config(**{**vars(args.model), **vars(args.train)})
+    processor = AutoProcessor.from_pretrained(args.model.tokenizer_path, trust_remote_code=True, local_files_only=True)
+    normalizer_reads = []
+    original = FeatureTransform.get_normalizer
+    def observed(self, path, *a, **kw):
+        assert Path(path).resolve() == bundle / 'normalization_stats.json'
+        normalizer_reads.append(dict(path=str(path), sha256=sha(path)))
+        return original(self, path, *a, **kw)
+    FeatureTransform.get_normalizer = observed
+    ds = VLADataset(str(bundle / 'dataset'), 'r5_follower', args.data,
+        args.data.robot_config_root, model_config, processor, chunk_size=50, image_size=(256,256))
+    assert len(ds) == sum(len(q) for q in all_states)
+    checked = []
+    start = 0
+    for q, record in zip(all_states, records):
+        for offset in sorted({0, len(q)//2, len(q)-2, len(q)-1}):
+            idx = start + offset
+            item = ds.getitem(idx)
+            assert item['state'].shape == (55,) and item['actions'].shape == (50,55)
+            assert int(item['state_joint_mask'].sum()) == int(item['action_joint_mask'].sum()) == 7
+            for key in ('images', 'state', 'actions'):
+                assert torch.isfinite(item[key]).all(), key
+            expected = q[np.minimum(np.arange(offset+1,offset+51),len(q)-1)]
+            restored_state = ds.feature_transform.normalizer.unnormalize({
+                'observation.state.arm.position':item['state'][:6],
+                'observation.state.effector.position':item['state'][28:29]})
+            restored_state = torch.cat([restored_state['observation.state.arm.position'],
+                                       restored_state['observation.state.effector.position']])
+            assert torch.allclose(restored_state, torch.from_numpy(q[offset]), atol=2e-6)
+            future = torch.cat([ds.feature_transform.normalizer.unnormalize({
+                'action.arm.position': item['actions'][:, :6]})['action.arm.position'],
+                ds.feature_transform.normalizer.unnormalize({
+                'action.effector.position': item['actions'][:, 28:29]})['action.effector.position']], dim=-1)
+            assert torch.allclose(future, torch.from_numpy(expected), atol=2e-6)
+            pad = torch.from_numpy(np.arange(offset+1,offset+51) >= len(q))
+            assert torch.equal(item['action_is_pad'].bool(), pad)
+            checked.append(dict(source=record['episode'], index=idx, valid_future=int((~pad).sum())))
+        start += len(q)
+    assert normalizer_reads
+    write(bundle / 'reader_checks.json', dict(status='PASS', samples=len(checked), checks=checked,
+        normalization_reads=normalizer_reads, actual_processor=True, actual_training_arguments=True,
+        padded_action_shape=[50,55], valid_dimensions=7, model_forward_backward_tested=False))
+
+
+def main():
+    bundle = Path(sys.argv[1]).resolve()
+    assert not (bundle / 'dataset').exists(), 'preserve previous partial dataset; use a new bundle'
+    assert not os.environ.get('CUDA_VISIBLE_DEVICES')
+    assert shutil.disk_usage(bundle).free > 220 * 1024**3
+    candidates, excluded = [], []
+    for session in SESSIONS:
+        m = read(session / 'session.json')
+        assert m['state'] == 'closed' and not m['test_only'] and m['task'] == TASK
+        for entry in m['episodes']:
+            folder = session / 'episodes' / entry['episode_id']
+            assert folder.resolve().parent == session / 'episodes'
+            e = read(folder / 'episode.json')
+            assert entry['label'] == e['label']
+            (candidates if e['label'] == 'success' else excluded).append(folder)
+    assert len(candidates) == 71 and len(excluded) == 12
+    write(bundle / 'selection.json', dict(task=TASK, candidates=[str(p) for p in candidates],
+        excluded=[str(p) for p in excluded], raw_metadata_modified=False))
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    features = {'observation.state': dict(dtype='float32', shape=(7,),
+                names=[f'q{i}_rad' for i in range(1,7)] + ['gripper_native'])}
+    for i in (1,2):
+        features[f'observation.images.camera_{i}'] = dict(dtype='image', shape=(256,256,3),
+                                                       names=['height','width','channels'])
+    dataset = LeRobotDataset.create(repo_id='r5/charger_first_train', root=bundle/'dataset', fps=30,
+        robot_type='arx_r5_single_follower', features=features, use_videos=False, image_writer_threads=4)
+    all_states, records, actions = [], [], []
+    (bundle / 'alignment').mkdir()
+    (bundle / 'previews').mkdir()
+    for number, folder in enumerate(candidates):
+        q, images, paired, timeline, report = decode(folder)
+        name = f'{folder.parent.parent.name}__{folder.name}'
+        path = bundle / 'alignment' / f'{name}.csv'
+        with path.open('w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=list(timeline[0])); writer.writeheader(); writer.writerows(timeline)
+        for frame, (i,j) in enumerate(paired):
+            dataset.add_frame({'observation.state': q[frame].copy(), 'task': TASK,
+                'observation.images.camera_1': images[CAMERAS[0]][i],
+                'observation.images.camera_2': images[CAMERAS[1]][j]})
+        dataset.save_episode()
+        source_hashes = {str(p): sha(p) for p in [folder/'episode.json', folder/'raw/bag/metadata.yaml', folder/'raw/bag/bag_0.mcap']}
+        record = dict(episode=name, source=str(folder), report=report, sha256=source_hashes)
+        records.append(record); all_states.append(q)
+        # Pooled, valid future positions only: no padded labels in statistics.
+        weights = np.minimum(np.arange(len(q)),50)
+        actions.append(np.repeat(q, weights, axis=0))
+        if number in (0,20,45,50):
+            tiles=[]
+            for c in (0,1):
+                tiles.append(np.concatenate([images[CAMERAS[c]][paired[k][c]]
+                    for k in (0,len(q)//2,len(q)-1)],axis=1))
+            cv2.imwrite(str(bundle/'previews'/f'{number:03d}.jpg'),
+                cv2.cvtColor(np.concatenate(tiles,axis=0),cv2.COLOR_RGB2BGR))
+        write(bundle / 'preparation_progress.json', dict(completed_episodes=number+1,target_episodes=71,
+            frames=sum(len(a) for a in all_states), last=record))
+        print(f'EPISODE_PASS {number+1}/71 {name} frames={len(q)}', flush=True)
+    dataset.finalize()
+    state_values = np.concatenate(all_states)
+    action_values = np.concatenate(actions)
+    norm = {}
+    for prefix, values in [('observation.state',state_values),('action',action_values)]:
+        norm[prefix+'.arm.position'] = stats(values[:,:6])
+        norm[prefix+'.effector.position'] = stats(values[:,6:])
+    write(bundle/'normalization_stats.json', dict(norm_stats=norm, count=len(state_values),
+        source='R5 accepted operator-success demonstrations only',
+        action_statistics='pooled valid t+1..t+50 future states, padding excluded',
+        gripper_units='SDK native, no fabricated physical endpoint calibration'))
+    np.savez(bundle/'aligned_states.npz', **{f'episode_{i:03d}':q for i,q in enumerate(all_states)})
+    config(bundle)
+    source = SOURCE / 'tasks/vla/train_lingbotvla.py'
+    shutil.copy2(source,bundle/'official_train_snapshot.py')
+    write(bundle/'data_manifest.json', dict(episodes=records,episode_count=71,frames=len(state_values),
+        task=TASK, fps=30, future_steps=50, image_resize='RGB 848x530 ->256x256 INTER_AREA; raw bags retained',
+        camera_pair_tolerance_ms=16.7, state_bracket_tolerance_ms=10,
+        robot_timestamps='SDK ROS publication time', hardware_sync_certified=False))
+    reader_checks(bundle,all_states,records)
+    bound = [bundle/'train.yaml',bundle/'train.txt',bundle/'normalization_stats.json',
+        bundle/'robot_configs/r5_follower.yaml',bundle/'data_manifest.json',bundle/'official_train_snapshot.py',
+        *sorted((bundle/'dataset').rglob('*.parquet'))]
+    write(bundle/'bindings.json',{str(p):sha(p) for p in bound})
+    write(bundle/'CPU_READY.json',dict(status='PASS',episodes=71,frames=len(state_values),
+        nice=0,training_steps=STEPS,normalization_sha256=sha(bundle/'normalization_stats.json')))
+    print('R5_TRAIN_CPU_READY',bundle,flush=True)
+
+
+if __name__ == '__main__':
+    main()

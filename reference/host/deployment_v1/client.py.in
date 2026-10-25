@@ -1,0 +1,32 @@
+"""Small bounded HTTP client; the remote service is reached through an SSH tunnel."""
+import json
+import urllib.request
+import time
+from contract import request,response_actions,PROTOCOL,NORM_SHA
+
+
+def health(url,timeout=5):
+    with urllib.request.urlopen(url.rstrip('/')+'/healthz',timeout=timeout) as response:
+        value=json.load(response)
+    if value.get('status')!='READY' or value.get('protocol')!=PROTOCOL or value.get('normalization_sha256')!=NORM_SHA:
+        raise ValueError('unrecognized model service')
+    return value
+
+
+def infer(url,observation,request_id,timeout=30):
+    packet=request(observation['state'],observation['camera_1'],observation['camera_2'],
+                   request_id,observation.get('stamps'))
+    encoded=json.dumps(packet,allow_nan=False).encode()
+    req=urllib.request.Request(url.rstrip('/')+'/infer',data=encoded,
+        headers={'Content-Type':'application/json'},method='POST')
+    started=time.monotonic()
+    with urllib.request.urlopen(req,timeout=timeout) as response:
+        length=response.headers.get('Content-Length')
+        if length is not None and int(length)>100000:raise ValueError('unexpected response size')
+        raw=response.read(100001)
+        if len(raw)>100000:raise ValueError('unexpected response size')
+        value=json.loads(raw)
+    actions=response_actions(value,request_id)
+    value['client_roundtrip_ms']=(time.monotonic()-started)*1000
+    value['request_bytes']=len(encoded)
+    return actions,value

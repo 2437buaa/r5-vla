@@ -1,0 +1,30 @@
+"""Submit this new run once, after its CPU gate succeeds."""
+import os
+from pathlib import Path
+import subprocess
+import sys
+from common import read, write
+
+b=Path(__file__).resolve().parent.parent
+cpu_job=sys.argv[1]
+assert cpu_job.isdecimal()
+assert read(b/'CPU_READY.json')['status']=='PASS'
+assert read(b/'BASE_VERIFIED.json')['status']=='PASS'
+state=subprocess.check_output(['sacct','-j',cpu_job,'-X','-n','-P','--format=State,ExitCode'],text=True).strip()
+running_inside_gate=os.environ.get('SLURM_JOB_ID')==cpu_job and state=='RUNNING|0:0'
+assert state=='COMPLETED|0:0' or running_inside_gate,state
+lock=b/'TRAIN_SUBMIT_LOCK'
+fd=os.open(lock,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600); os.close(fd)
+env=dict(os.environ,R5_TRAIN_BUNDLE=str(b))
+result=subprocess.run(['sbatch','--parsable','--nice=0',f'--dependency=afterok:{cpu_job}',
+    '--kill-on-invalid-dep=yes',f'--output={b}/logs/train-%j.out',f'--error={b}/logs/train-%j.err',
+    str(b/'scripts/train.sbatch')],env=env,text=True,capture_output=True)
+if result.returncode:
+    write(b/'submission_failure.json',dict(stdout=result.stdout,stderr=result.stderr))
+    raise RuntimeError(result.stderr)
+job=result.stdout.strip().split(';')[0]; assert job.isdecimal(),result.stdout
+write(b/'submission.json',dict(state='submitted',jobs={'data_prepare':'4416','reader_gate':cpu_job,'base_verify':'4420','train':job},nice=0,
+    GPUs=2,target_updates=4000,checkpoint_steps=[2000,4000],episodes=71,bundle=str(b),output=str(b/'output'),
+    dependency=f'afterok:{cpu_job}',automatic_hardware_motion=False))
+print('TRAIN_JOB_ID='+job,flush=True)
+subprocess.run(['scontrol','show','job',job,'-o'],check=True)

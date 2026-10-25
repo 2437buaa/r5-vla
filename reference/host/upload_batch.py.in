@@ -1,0 +1,87 @@
+"""Upload a CLOSED batch session, verify SHA256, optionally queue CPU checks.
+
+No image/trajectory processing on this computer. No deletion or GPU request.
+"""
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import shlex
+import subprocess
+
+HOST='{{SSH_TARGET}}'
+BASE='{{SERVER_ROOT}}/real_robot/r5/batches'
+TEMPLATE='{{DECODER_ENV}}'
+ROOT=Path(__file__).resolve().parent
+
+
+def ssh(command,**kwargs):
+    return subprocess.run(['ssh','-o','BatchMode=yes','-o','ConnectTimeout=15',HOST,command],check=True,**kwargs)
+
+
+def main():
+    p=argparse.ArgumentParser(description=__doc__)
+    p.add_argument('session',type=Path)
+    p.add_argument('--process',action='store_true',help='Submit CPU Slurm validation after upload/hash verification')
+    p.add_argument('--include-test-episodes',action='store_true')
+    a=p.parse_args();s=a.session.resolve()
+    m=json.loads((s/'session.json').read_text())
+    if m['state']!='closed':p.error('Close the batch recorder before uploading')
+    if not s.name.startswith('r5_session_') or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-' for c in s.name):
+        p.error('Unexpected session directory name')
+    dest=BASE+'/'+s.name
+    hashes=[]
+    for file in sorted(s.rglob('*')):
+        if file.is_symlink():p.error('Symlink in session is not accepted')
+        if file.is_file():
+            h=hashlib.sha256()
+            with file.open('rb') as f:
+                for block in iter(lambda:f.read(4*1024*1024),b''):h.update(block)
+            hashes.append(h.hexdigest()+'  '+str(file.relative_to(s)))
+    # Refuse overwriting another session; an interrupted transfer is resumed only
+    # when its source session.json matches this exact closed local session.
+    marker_hash=hashlib.sha256((s/'session.json').read_bytes()).hexdigest()
+    q=shlex.quote
+    gate=f'''if test -d {q(dest)}; then
+test -f {q(dest+'/session.json')} && test "$(sha256sum {q(dest+'/session.json')} | cut -d ' ' -f 1)" = {q(marker_hash)}
+else mkdir -p {q(dest)}; fi'''
+    ssh(gate)
+    # Send the marker first so a partial large-file upload can be resumed safely.
+    transport='ssh -o BatchMode=yes -o ConnectTimeout=15'
+    subprocess.run(['rsync','-rt','-e',transport,str(s/'session.json'),HOST+':'+dest+'/'],check=True)
+    subprocess.run(['rsync','-rt','--partial','--info=progress2','-e',transport,str(s)+'/',HOST+':'+dest+'/'],check=True)
+    ssh('cd '+q(dest)+' && sha256sum --check -',input='\n'.join(hashes)+'\n',text=True)
+    print('UPLOAD_SHA256_PASS '+dest,flush=True)
+    if not a.process:return
+    ssh('mkdir -p '+q(dest+'/scripts')+' '+q(dest+'/logs')+' '+q(dest+'/cache/tmp'))
+    script_dir=ROOT/'server_processing'
+    subprocess.run(['rsync','-rt','-e',transport,str(script_dir/'validate_batch.py'),
+                    str(script_dir/'validate_follower.py'),HOST+':'+dest+'/scripts/'],check=True)
+    # Keep environment/caches scoped to this session; use already prepared MCAP
+    # decoder modules, without altering the shared training environment.
+    env=dict(CUDA_VISIBLE_DEVICES='',OMP_NUM_THREADS='4',OPENBLAS_NUM_THREADS='4',MKL_NUM_THREADS='4',
+             HF_HOME=dest+'/cache/huggingface',HF_DATASETS_CACHE=dest+'/cache/datasets',
+             TMPDIR=dest+'/cache/tmp',PYTHONDONTWRITEBYTECODE='1',
+             HF_HUB_OFFLINE='1',HF_DATASETS_OFFLINE='1',TOKENIZERS_PARALLELISM='false',
+             PYTHONPATH=TEMPLATE+'/deps_active:{{LINGBOT_SOURCE}}')
+    command=['env']+[k+'='+v for k,v in env.items()]+[
+        '{{TRAIN_PYTHON}}','-u',dest+'/scripts/validate_batch.py',
+        '--session',dest]
+    if a.include_test_episodes:command.append('--include-test-episodes')
+    wrap=shlex.join(command)
+    submit=shlex.join(['sbatch','--parsable','--nice=0','--partition=gpu','--cpus-per-task=4',
+        '--mem=16G','--time=04:00:00','--job-name=r5-batch-data-check','--chdir='+dest,
+        '--output='+dest+'/logs/process-%j.out','--error='+dest+'/logs/process-%j.err','--wrap='+wrap])
+    # No automatic duplicate submission for the same upload.
+    marker=dest+'/submission.txt'
+    # Persist an intent lock even if the connection drops after sbatch returns.
+    # An uncertain submission must be inspected, never blindly resubmitted.
+    ssh('test ! -e '+q(marker)+' && mkdir '+q(dest+'/.submission_lock'))
+    result=ssh(submit,capture_output=True,text=True)
+    job=result.stdout.strip().split(';')[0]
+    if not job.isdigit():raise RuntimeError('Unclear submission result: '+result.stdout)
+    ssh('tee '+q(marker)+' >/dev/null',input=job+'\n',text=True)
+    print('CPU_JOB_ID='+job+' NICE=0 GPU=0',flush=True)
+
+
+if __name__=='__main__':main()

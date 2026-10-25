@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+R5_TOOL_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+exec env -u PYTHONPATH -u PYTHONHOME -u LD_LIBRARY_PATH \
+  -u CMAKE_PREFIX_PATH -u AMENT_PREFIX_PATH -u COLCON_PREFIX_PATH \
+  -u CONDA_PREFIX -u CONDA_DEFAULT_ENV -u CONDA_SHLVL \
+  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-85}" ROS_LOCALHOST_ONLY=1 PYTHONNOUSERSITE=1 \
+  /bin/bash --noprofile --norc -c \
+  'source /opt/ros/humble/setup.bash; source {{ROS_WORKSPACE}}/install/setup.bash; exec /usr/bin/python3 "$@"' \
+  r5-batch "$R5_TOOL_ROOT/batch_record.py" "$@"

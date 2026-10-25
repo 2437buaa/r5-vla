@@ -1,0 +1,116 @@
+"""Read two live RGB streams and follower feedback; only LOG model predictions.
+
+No command message imports, command publishers, SDK startup or CAN access.
+"""
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+import time
+import json
+import numpy as np
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import Image
+from arx5_arm_msg.msg import RobotStatus
+from synchronization import ObservationBuffer
+from contract import write, read, digest
+from client import health,infer
+from trajectory_guard import guard_trajectory, validate_profile, GuardRejected
+
+
+class PreviewNode(Node):
+    def __init__(self):
+        super().__init__('r5_vla_readonly_preview')
+        self.observations=ObservationBuffer();self.invalid=0
+        for i in (1,2):
+            name=f'camera_{i}'
+            self.create_subscription(Image,f'/{name}/color/image_raw',
+                lambda msg,key=name:self.image(key,msg),qos_profile_sensor_data)
+        self.create_subscription(RobotStatus,'/r5_pair/follower_status',self.state,qos_profile_sensor_data)
+
+    def image(self,name,msg):
+        if msg.encoding!='rgb8' or (msg.height,msg.width)!=(530,848):
+            self.invalid+=1;return
+        a=np.frombuffer(msg.data,dtype=np.uint8).reshape(msg.height,msg.step)
+        a=a[:,:msg.width*3].reshape(msg.height,msg.width,3).copy()
+        self.observations.add(name,msg.header.stamp.sec*10**9+msg.header.stamp.nanosec,a)
+
+    def state(self,msg):
+        q=np.asarray(msg.joint_pos,dtype=np.float32)
+        if q.shape!=(7,) or not np.isfinite(q).all():self.invalid+=1;return
+        self.observations.add('state',msg.header.stamp.sec*10**9+msg.header.stamp.nanosec,q)
+
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--url',default='http://127.0.0.1:8765')
+    parser.add_argument('--seconds',type=float,default=30)
+    parser.add_argument('--execute-steps',type=int,choices=[10,25,50],default=50,
+        help='preview re-observation interval only; no actions are executed')
+    parser.add_argument('--log-root',type=Path,default=Path(__file__).resolve().parent.parent/'logs')
+    parser.add_argument('--guard-profile',type=Path,default=Path(__file__).with_name('guard_profile.json'),
+        help='required preview-only task envelope; missing/invalid profile is an error')
+    args=parser.parse_args()
+    if not 1<=args.seconds<=600:raise ValueError('preview duration must be1..600s')
+    profile=read(args.guard_profile);validate_profile(profile)
+    metadata=health(args.url)
+    output=args.log_root/('model-readonly-preview-'+time.strftime('%Y%m%dT%H%M%S'))
+    output.mkdir(parents=True,exist_ok=False)
+    write(output/'metadata.json',dict(server=metadata,motor_commands_sent=False,command_publishers=0,
+        guard_profile_sha256=digest(args.guard_profile),guard_profile=profile,
+        guard_implementation_sha256=digest(Path(__file__).with_name('trajectory_guard.py')),
+        hardware_execution_eligible=False))
+    print('READ_ONLY_PREVIEW',output,'No robot motion commands.',flush=True)
+    rclpy.init();node=PreviewNode();executor=ThreadPoolExecutor(max_workers=1)
+    pending=None;last_stamp=-1;count=0;next_at=0;warning_at=0;filtered_count=0;rejected_count=0
+    started=time.monotonic();pending_obs=None
+    try:
+        while rclpy.ok() and time.monotonic()-started<args.seconds:
+            rclpy.spin_once(node,timeout_sec=.01)
+            if pending is not None and pending.done():
+                actions,response=pending.result();pending=None;count+=1
+                response.update(observation_state=pending_obs['state'].tolist(),
+                    first_target_delta_rad=(actions[0,:6]-pending_obs['state'][:6]).tolist(),
+                    motor_commands_sent=False)
+                try:
+                    current,feedback_age,feedback_stamp=node.observations.feedback_snapshot(
+                        max_age_s=profile['settings']['max_feedback_age_s'])
+                    response['guard_reference_state']=current.tolist()
+                    response['guard_reference_header_ns']=feedback_stamp
+                    response['guard']=guard_trajectory(actions,current,profile,
+                        observation_age_s=(time.monotonic_ns()-pending_obs['selected_received_monotonic_ns'])/1e9,
+                        feedback_age_s=feedback_age)
+                    filtered_count+=1
+                except (GuardRejected,ValueError) as exc:
+                    response['guard']=dict(status='REJECTED',reason=str(exc),
+                        hardware_execution_eligible=False,motor_commands_sent=False)
+                    rejected_count+=1
+                write(output/f'prediction_{count:04d}.json',response)
+                print('PREDICTION',count,'50x7','roundtrip_ms=',round(response['client_roundtrip_ms'],1),
+                      'guard=',response['guard']['status'],
+                      'first_target_delta_rad=',response['first_target_delta_rad'],flush=True)
+                next_at=time.monotonic()+args.execute_steps/30
+            if pending is None and time.monotonic()>=next_at:
+                try:
+                    obs=node.observations.latest()
+                    stamp=obs['stamps']['camera_1_header_ns']
+                    if stamp<=last_stamp:continue
+                    last_stamp=stamp;pending_obs=obs
+                    pending=executor.submit(infer,args.url,obs,f'preview-{time.time_ns()}')
+                except ValueError as exc:
+                    if time.monotonic()>warning_at:
+                        print('WAITING_FOR_VALID_OBSERVATION',str(exc),flush=True);warning_at=time.monotonic()+3
+    finally:
+        executor.shutdown(wait=True,cancel_futures=True)
+        write(output/'summary.json',dict(status='READONLY_PREVIEW_FINISHED',predictions=count,
+            motor_commands_sent=False,command_publishers=0,invalid_messages=node.invalid,
+            filtered_predictions=filtered_count,rejected_predictions=rejected_count,
+            hardware_execution_eligible=False,
+            non_increasing_timestamps=node.observations.non_increasing,
+            physical_motor_feedback_freshness_certified=False))
+        node.destroy_node();rclpy.shutdown()
+    if count==0:raise SystemExit('No complete predictions; inspect camera/state streams or service.')
+
+
+if __name__=='__main__':main()
