@@ -6,18 +6,20 @@
 
 An end-to-end engineering record for ARX R5 teleoperation, demonstration collection and LingBot-VLA deployment. Collection uses two identical arms in leader–follower mode; the policy controls one execution arm. Wrist and external Gemini 305 cameras provide RGB observations. The hardware host uses Ubuntu 22.04, ROS 2 Humble and system Python 3.10; training and inference use a separate server environment.
 
-The historical sources are under `reference/host/*.in`. They are not a new general-purpose robotics framework. `scripts/materialize.py` substitutes paths/device identities into a Git-ignored `runtime/` copy. It does not import reference modules, start hardware or submit jobs.
+Source templates live in `reference/host/*.in`. `scripts/materialize.py` substitutes local paths and device identities to generate `runtime/`. Local configuration and runtime artifacts are Git-ignored.
 
 ## Workflow
 
-1. Read [safety](docs/safety.md) and [setup](docs/setup.md). Obtain pinned upstream sources and vendor SDKs separately.
-2. Configure local paths and CAN identities in `config/site.local.json`, then materialize a local runtime. Local configuration does not alter the versioned snapshot.
-3. Follow [teleoperation](docs/teleoperation.md). Verify arm identities, CAN0/CAN1, ordinary-gripper 1:1 mapping and initialization behavior. SDK startup may enable/home the arm and is not read-only.
-4. Follow [recording](docs/recording.md). Start both cameras, record a test-only episode, then collect labelled batches. Recording does not own teleoperation or stop the robot.
-5. Validate timestamps, images, states, labels and episode boundaries using the [data contract](docs/data-format.md). Matching task names alone do not make datasets compatible.
-6. Upload, verify and [train](docs/training.md) on the server: CPU data checks, official-base verification, then normal Slurm scheduling with `nice=0`. Do not modify other users' jobs.
-7. Follow [deployment](docs/deployment.md): bind weights and normalization, preview without commanding motors, prepare the site, then let the operator launch execution manually. Never let teleoperation and policy control the same follower concurrently.
-8. Record evaluations separately and export dual-view MP4s afterwards. Preserve original MCAPs. Exported videos are derivatives and do not establish hardware synchronization.
+1. [Install dependencies](docs/setup.md): ROS 2, vendor SDKs, camera drivers and the training environment.
+2. Configure `config/site.local.json` and generate the runtime directory.
+3. [Start teleoperation](docs/teleoperation.md): leader on `can0`, follower on `can1`, ordinary-gripper mapping at 1:1.
+4. [Record demonstrations](docs/recording.md): start both cameras, run a test-only recording, then collect and label batches.
+5. [Process data](docs/data-format.md): validate messages, timestamps and labels, then align RGB views and follower state.
+6. [Train](docs/training.md): prepare data, verify the base model and run two-GPU training on the server.
+7. [Deploy](docs/deployment.md): start inference, establish the SSH tunnel, preview predictions and execute the policy.
+8. Record evaluations separately and export dual-view MP4s.
+
+See [safety](docs/safety.md) for hardware startup and control-mode switching.
 
 ## Recorded experiment
 
@@ -25,15 +27,10 @@ Task: `Put the charger in the box`. Four batches supplied 71 human-success-label
 
 The policy consumes two RGB views, six absolute follower joint positions plus native gripper state, and task text. It predicts 50 seven-dimensional absolute targets; each segment is published at nominal 30 Hz, followed by a fresh observation and inference. Inference latency creates gaps. The 500-target budget is not 500 closed-loop inference iterations.
 
-One log records 300 model targets followed by an operator-entered completion report. This supports actual model-driven execution, not a measured overall success rate, automatic success detection or independently verified intervention-free evaluation. Weights, raw data and videos are not included.
+One test records 300 model targets before the operator ended the run and marked completion. Automatic success detection and an aggregate success-rate evaluation are not implemented; see the [experiment record](docs/provenance.md).
 
-## Portability limits
+## Adapting to a new environment
 
-- The training reference retains experiment-specific 71/12 counts, session names and 2k/4k boundaries. New datasets require deliberate changes and renewed checks.
-- Some motion/return scripts depend on a particular SDK SHA, binary offsets or demonstration start pose. Do not substitute a new hash to bypass an ABI review.
-- Several feedback/speed checks were commented out during onsite work. The export preserves that state; it does not claim those checks are active or further relax control logic.
-- Historical source comments/log labels can be stale. Use current documentation, actual source and fresh acceptance evidence.
-
-## Collaboration and publication
-
-Use branches and pull requests. A repository administrator can invite named GitHub users through Settings → Collaborators. Private visibility does not justify committing credentials, raw recordings or weights. Complete the [public-release checklist](docs/public-release-checklist.md) before making the repository public.
+- Update session lists, the experiment-specific 71/12 episode counts and 2k/4k settings when changing datasets.
+- Some motion/return tools depend on a particular SDK SHA, binary layout and demonstration start pose.
+- Current feedback-check behavior is documented in [safety](docs/safety.md).

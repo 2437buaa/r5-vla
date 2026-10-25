@@ -8,23 +8,23 @@
 
 ## 中文
 
-R5 真机工程记录与工具集：两台同型号 R5 一主一从采集示范，两台 Gemini 305 提供腕部和外部 RGB 视角，基于 LingBot-VLA 2.0 独立训练，部署时由模型控制一台从臂。
+R5 VLA 提供 ARX R5 从遥操作、示范采集到模型训练与真机部署的完整流程。两台 R5 采用主从方式采集数据，两台 Gemini 305 提供腕部和外部 RGB 视角，LingBot-VLA 2.0 策略控制一台从臂执行任务。
 
-包含批量 MCAP 录制、人工标签、从臂与双相机时间对齐、数据校验、双视图 MP4 导出、双 GPU 训练参考、远程推理和原厂 SDK 执行桥。默认不录深度；不包含原始示范、视频、权重、密钥或原厂二进制。
+功能包括批量 MCAP 录制、回合标注、双相机与从臂状态对齐、数据校验、双视图 MP4 导出、双 GPU 训练、远程推理和原厂 SDK 控制接口。默认使用 RGB，不录制深度。
 
-这是**私有阶段的开源准备仓库**，不是一键即用的机器人产品。`reference/` 是经过路径脱敏的历史工程快照，保留既有控制逻辑和局限；先生成本地配置，再逐项审查。不要把示例参数、原型保护或一次人工确认的演示当作安全认证。
+代码模板位于 `reference/`，通过本地配置生成 `runtime/` 运行目录。模型权重、原始示范和 SDK 二进制单独获取。
 
-已记录的实验：71 条人工成功标签示范、24,576 帧、4000 次更新，2000/4000 步导出；一次模型执行发送 6×50 条目标后由操作员确认完成。**无独立实机验证集，无核验后的整体成功率，无全程无人干预认证。** 自采数据与 clean-only 仿真比赛模型分离。
+充电器入盒实验使用 71 条示范、24,576 帧，训练 4000 次更新，在 2000/4000 步导出模型。部署采用预测 50 步、执行 50 步、重新观察的方式，动作段内按 30 Hz 发布目标。实验配置和测试记录见[实验记录](docs/provenance.md)。
 
 ## English
 
-An engineering toolkit and reproducibility record for ARX R5: collect demonstrations with two identical arms in leader–follower teleoperation, observe the follower with wrist and external Gemini 305 RGB cameras, train a dedicated LingBot-VLA 2.0 policy, and deploy it on one follower arm.
+R5 VLA covers ARX R5 teleoperation, demonstration collection, model training and real-robot deployment. Two R5 arms collect leader–follower demonstrations, two Gemini 305 cameras provide wrist and external RGB views, and a LingBot-VLA 2.0 policy controls one follower arm.
 
-Includes batched MCAP recording, human labels, camera/follower alignment, dataset checks, dual-view MP4 export, two-GPU training references, remote inference and a vendor-SDK execution bridge. Depth recording is off by default. Raw demonstrations, videos, weights, credentials and vendor binaries are excluded.
+Features include batched MCAP recording, episode labels, camera/follower alignment, dataset checks, dual-view MP4 export, two-GPU training, remote inference and a vendor-SDK control interface. RGB is used by default; depth recording is disabled.
 
-This is a **private, pre-publication engineering repository**, not a turnkey robot product. `reference/` preserves path-tokenized historical code, including known limitations. Materialize a local configuration and review it before use. Example values, prototype checks and an operator-reported demonstration are not safety certification.
+Source templates live in `reference/`; local configuration generates the `runtime/` directory. Model weights, raw demonstrations and SDK binaries are obtained separately.
 
-Recorded experiment: 71 human-success-labelled demonstrations, 24,576 aligned frames, 4,000 updates, exports at 2k/4k. One execution sent 6×50 model targets before operator confirmation. **No held-out real-robot validation set, audited overall success rate, or independently verified intervention-free evaluation.** Self-collected data are separate from clean-only simulation competition training.
+The charger-in-box experiment uses 71 demonstrations, 24,576 aligned frames and 4,000 updates, with exports at 2k/4k. Deployment predicts and executes 50 targets before observing again, publishing at 30 Hz within each segment. See the [experiment record](docs/provenance.md) for configuration and test details.
 
 ## Workflow / 流程
 
@@ -36,9 +36,9 @@ Recorded experiment: 71 human-success-labelled demonstrations, 24,576 aligned fr
 | Alignment & labels / 时间对齐与标签 | [Data format](docs/data-format.md) | [Preparation](reference/host/training_v1/prepare.py.in) |
 | Train / 训练 | [Training](docs/training.md) | [Trainer](reference/host/training_v1/train.py.in) |
 | Deploy / 部署 | [Deployment](docs/deployment.md) | [Policy adapter](reference/host/deployment_v1/adapter.py.in), [Execution bridge](reference/host/deployment_v1/trial50.py.in) |
-| Evidence & limits / 证据与边界 | [Provenance](docs/provenance.md) | [Manifest](provenance/source-manifest.json) |
+| Experiment record / 实验记录 | [Provenance](docs/provenance.md) | [Manifest](provenance/source-manifest.json) |
 
-## Start without hardware / 无硬件开始
+## Quick start / 快速开始
 
 ```bash
 git clone https://github.com/2437buaa/r5-vla.git
@@ -46,13 +46,13 @@ cd r5-vla
 python3 scripts/check_repository.py
 python3 -m unittest discover -s tests -v
 cp config/site.example.json config/site.local.json
-# Edit local paths and device identities; do not commit site.local.json.
-# 修改本地路径和设备身份；不要提交 site.local.json。
+# Set local paths and adapter serial numbers in config/site.local.json.
+# 在 config/site.local.json 中填写路径和适配器序列号。
 python3 scripts/materialize.py --config config/site.local.json --output runtime
 ```
 
-These commands do not launch ROS, cameras, CAN, training, or robot motion. Configuration is not hardware acceptance. / 上述命令不会启动 ROS、相机、CAN、训练或机械臂；配置成功不代表硬件验收。
+Next: [setup](docs/setup.md) → [teleoperation](docs/teleoperation.md) → [recording](docs/recording.md) → [training](docs/training.md) → [deployment](docs/deployment.md).
 
 ## License / 许可
 
-Project-authored code and documentation: [Apache-2.0](LICENSE). The attributed ARX wrapper retains [BSD-3-Clause](integrations/arx/LICENSE.ARX). External SDKs, models and datasets retain their own terms; see [third-party notices](THIRD_PARTY_NOTICES.md). Public release remains a separate owner decision.
+Code and documentation: [Apache-2.0](LICENSE). The ARX wrapper uses [BSD-3-Clause](integrations/arx/LICENSE.ARX). See [third-party notices](THIRD_PARTY_NOTICES.md) for dependencies.

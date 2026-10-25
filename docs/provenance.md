@@ -1,10 +1,10 @@
-# Provenance / 来源与实验记录
+# Experiment record / 实验记录
 
 ## 中文
 
-整理日期：2026-10-25，北京时间。此仓库从原工程白名单导出，不携带原工作区 Git 历史、账号配置、日志、原始数据、视频或模型权重。原运行目录未被迁移或修改。
+任务：`Put the charger in the box`。一台 R5 执行充电器抓取入盒，两台 Gemini 305 提供腕部与外部视角。
 
-源码来源见 `provenance/source-manifest.json`：每项记录原文件 SHA256 和脱敏模板 SHA256。脱敏仅替换路径、设备序列号与服务器身份，不重新实现控制逻辑。服务器上实际使用的训练脚本（含 `prepare_checked.py`）与实际 `train.yaml` 已补齐，不只依赖本机较早副本。
+`provenance/source-manifest.json` 记录原文件和模板的 SHA256。模板中的路径、设备序列号和服务器配置由本地 site 文件填入。训练实现包括 `prepare_checked.py`，训练参数见 `reference/train-config.yaml.in`。
 
 固定依赖：
 
@@ -15,20 +15,22 @@
 | LingBot-VLA code | `be969b8fd117fb70550c5d4bf4bc328211b5b1b6` |
 | Base model | `robbyant/lingbot-vla-v2-6b`; exact shard metadata in the reference verifier |
 
-示范任务 `Put the charger in the box`；71 条人工成功标签、24,576 帧；两 GPU 训练 4000 次更新，无独立验证集。一次现场模型日志记录 300 条目标、操作员报告完成、未自动验证成功。不是整体 100% 成功或无人干预认证。
+训练使用 71 条人工标记成功的示范，共 24,576 帧。两 GPU 训练 4000 次更新，在 2000/4000 步导出。全部示范用于训练，未设置独立验证集。
 
-历史归一化 SHA256：`3f275d6a06931b34c790d8d9784ad57bc13e21b24d9059674bbc0aeb9803d022`。特定原厂 SDK 库 SHA256：`30239795532e0d440842405f02092c85f95b5f4b0813c2bdf95b22d89960fa18`。这些指纹不是文件下载地址，也不授权绕过新环境验收。
+本次归一化 SHA256：`3f275d6a06931b34c790d8d9784ad57bc13e21b24d9059674bbc0aeb9803d022`。
 
-原始视频和 bag 不在本仓库发布。双视图 MP4 涉及拼接、标注、编码与时间网格选帧；源时间戳间隙可导致显式标注的重复帧，不称作未经处理原片。视频文件之间对应关系及全程人工干预声明需另行核验。
+SDK 库 SHA256：`30239795532e0d440842405f02092c85f95b5f4b0813c2bdf95b22d89960fa18`。
 
-自采实机数据与 clean-only RoboTwin 仿真比赛分开管理；不以此仓库宣称比赛合规认证或官方真机成绩。
+一次模型测试记录发送 6 段、共 300 条目标，随后由操作员结束运行并标记完成。当前测试未实现自动成功判定，未统计整体成功率或单独记录干预率。
+
+评测录制单独保存，不参与训练。双视图 MP4 从 MCAP 导出，包含视图拼接、时间标注和 30 FPS 选帧；跨越时间戳间隙时重复最近帧并标注。
 
 ## English
 
-Prepared on 2026-10-25 (Asia/Shanghai). This allowlisted export excludes original Git history, account settings, logs, raw data, videos and weights. Original runtime directories are unchanged.
+Task: `Put the charger in the box`. One R5 performs the task, with wrist and external Gemini 305 views.
 
-The manifest stores original and tokenized source hashes. Export changes paths/device/site identity only, not control logic. Actual server training scripts, including `prepare_checked.py`, and the real training YAML are included as sanitized references.
+The source manifest records original/template hashes. Local site configuration supplies paths, device identities and server settings. Training uses `prepare_checked.py` and the configuration in `reference/train-config.yaml.in`.
 
-The dependency revisions above and historical normalization/SDK hashes support traceability, not download entitlement or acceptance of a different environment. The recorded experiment is 71 demonstrations, 24,576 frames, two-GPU 4k training and one operator-reported 300-target execution, without independent validation or an audited success rate.
+Training uses 71 human-success-labelled demonstrations and 24,576 aligned frames, two GPUs and 4,000 updates, with exports at 2k/4k. All demonstrations are used for training; there is no held-out validation set. Normalization and SDK hashes are listed above.
 
-MP4 exports are processed viewing derivatives. Keep raw evidence and independently check video/run correspondence and intervention claims. This real-robot project is separate from clean-only simulation training and does not assert official competition compliance or scores.
+One policy test sent six segments totaling 300 targets before the operator ended the run and marked completion. Automatic success detection, aggregate success rate and a separate intervention-rate evaluation are not implemented. Evaluation recordings are excluded from training. Dual-view MP4s combine views, timestamps and 30 FPS frame selection; timestamp gaps use annotated repeated frames.

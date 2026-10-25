@@ -2,16 +2,19 @@
 
 ## 中文
 
-仓库先保持 private。管理员通过 Settings → Collaborators，以队友 GitHub 用户名邀请；队友接受后克隆仓库。管理页面不是所有人通用的邀请链接，真实邀请绑定指定账号。
+本地配置使用 `config/site.local.json`，运行目录为 `runtime/`。两者以及数据、模型和日志均由 `.gitignore` 排除。
 
-建议每项修改新建分支，通过 Pull Request 说明修改、验证方式、是否可能影响硬件运动。不要直接覆盖历史证据或改写共享分支历史。硬件相关改动不得靠 GitHub Actions 自动实机验收。
+文档和代码检查：
 
-本地配置放 `config/site.local.json`，生成副本放 `runtime/`，均不提交。原始 bag、图像、视频、权重及带个人/服务器信息的日志默认不提交。控制逻辑变更与路径重构分开提交；如改动参考源文件，需要同步更新来源 manifest 并披露其已不再是原始导出快照。
+```bash
+python3 scripts/check_repository.py
+python3 -m unittest discover -s tests -v
+```
+
+`provenance/source-manifest.json` 记录参考文件的 SHA256。修改参考源文件时同步更新对应条目。CI 执行静态检查和配置生成测试。
 
 ## English
 
-Keep the repository private initially. Administrators invite specific GitHub usernames in Settings → Collaborators. The management page is not a universal invitation link; actual invitations are account-bound.
+Local configuration uses `config/site.local.json`; generated files live in `runtime/`. Both are Git-ignored, along with data, models and logs.
 
-Use feature branches and pull requests describing the change, verification and possible motion effects. Preserve evidence and shared history. CI must never perform physical hardware acceptance.
-
-Keep local configuration and rendered runtime untracked. Do not commit raw bags, images, videos, weights or identifying logs by default. Separate control changes from path refactors. If a reference source changes, update its provenance manifest and disclose that it is no longer an unchanged export.
+Run the checks above before submitting changes. `provenance/source-manifest.json` records reference-file SHA256 values; update the corresponding entries when reference sources change. CI runs static checks and configuration-rendering tests.

@@ -2,17 +2,17 @@
 
 ## 中文
 
-部署分三层：服务器模型推理 → SSH 隧道 → 本机 ROS/原厂 SDK 执行。服务器 HTTP 服务不接触 CAN 或 ROS，默认仅监听 `127.0.0.1:18765`。它没有面向公网的认证，不要改成公网监听。
+部署分三层：服务器模型推理 → SSH 隧道 → 本机 ROS/原厂 SDK 执行。HTTP 服务监听 `127.0.0.1:18765`，通过 SSH 转发访问，不提供认证。
 
 ### 模型侧
 
-将 `runtime/host/deployment_v1/` 放在服务器 `$R5_DEPLOY_ROOT/scripts/`。输入训练 YAML、R5 robot config、归一化统计和目标 HF checkpoint 必须来自同一次训练。`contract.py` 的历史 NORM_SHA 与 4000 步/50 步断言必须有实际来源，不能只为了跑通而改成任意值。
+将 `runtime/host/deployment_v1/` 放在服务器 `$R5_DEPLOY_ROOT/scripts/`。部署加载同次训练的 YAML、R5 robot config、归一化统计和 HF checkpoint。`contract.py` 配置归一化 SHA、checkpoint 步数与预测长度。
 
-原生模型输出七维绝对目标，预测 50 步、10 次去噪、bf16。2k/4k 模型和真实训练输入一致性检查代码保留在参考目录；若要运行需单独授权/提交，不是本仓库 CI 的一部分。过去真实录制样本上的离线误差不等于独立验证或闭环成功率。
+推理使用 bf16、10 次去噪，输出 50 步七维绝对目标。`prepare.py` 检查训练/部署输入一致性，`offline.py` 对 2k/4k checkpoint 进行录制样本推理。
 
-`serve.sbatch` 是历史两小时服务参考，GPU 数 1、nice=0。现场曾另以 48 小时上限申请服务。新环境按实际时限配置并正常排队，不假设始终有空闲卡，也不自动续租。
+`serve.sbatch` 默认申请 1 张 GPU，`nice=0`，时限 2 小时。服务时长通过 `#SBATCH --time` 调整。
 
-在原服务验收标志确由当前模型检查产生后，操作员提交服务：
+模型检查生成 `OFFLINE_COMPLETE.json` 后，提交服务：
 
 ```bash
 export R5_DEPLOY_ROOT=/srv/r5/real_robot/r5/deployment/charger_preview
@@ -32,7 +32,7 @@ ssh -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -N \
 
 ### 本机 SDK 与只读预览
 
-停止遥操，确保只有一个从臂控制者。CAN 按遥操章节准备，但模型从臂使用 `normal` 模式和独立命令话题，不再订阅主臂状态。**下面 SDK 启动可使能/回零，由现场手动执行：**
+停止遥操后，将从臂切换到 `normal` 模式，订阅独立的模型命令话题。SDK 启动会使能并可能回零：
 
 ```bash
 ROS_DOMAIN_ID=85 ROS_LOCALHOST_ONLY=1 ros2 run arx_r5_controller R5Controller --ros-args \
@@ -49,27 +49,27 @@ ROS_DOMAIN_ID=85 ROS_LOCALHOST_ONLY=1 ros2 run arx_r5_controller R5Controller --
 bash runtime/host/deployment_v1/raw_preview.sh --samples 3
 ```
 
-该命令不创建运动发布器。不要为了解决预览问题盲目重启 SDK。初始位姿及物品准备由操作员完成；`move_to_demo_start.py`/`return_to_task_start.sh` 含特定示范位形、SDK 二进制偏移和已停用的反馈检查，不作为新机器的通用回位命令。
+`raw_preview.sh` 读取实时观测并保存预测，不发布控制目标。`move_to_demo_start.py` 和 `return_to_task_start.sh` 使用本次示范初始位形及固定 SDK 二进制布局，适配说明见[安全说明](safety.md)。
 
-### 显式执行
+### 执行任务
 
-现场重新确认准备完成后，操作员在前台手动执行，保持可输入的终端：
+机械臂、物品和工作区准备就绪后，在交互终端运行：
 
 ```bash
 bash runtime/host/deployment_v1/task500.sh \
   --execute --confirm-clear --sdk-log /path/to/current-sdk.log
 ```
 
-预测 50、执行 50、再观察，最多 500 条目标；动作段内名义 30 Hz，不是 30 Hz 推理。按回车仅表示操作员报告完成，没有自动成功检测。保留每段输入时间、预测、发送记录及人工干预说明，另录 test-only bag。
+每次预测并执行 50 条目标，再取新观测，上限 500 条。段内按名义 30 Hz 发布，段间包含推理等待。按回车结束并标记完成；程序未实现自动成功检测。测试录像使用单独的 test-only bag。
 
-外层未修改模型目标，但原厂 SDK 内部仍有软件饱和/插值。若源码中反馈速度、跟踪、推理期间位移检查已被注释，就不能宣称它们有效；详见安全文档。停止发布不是急停，最后目标可能继续执行或保持。
+执行桥传递原始模型目标，SDK 内部进行软件饱和与插值。当前反馈检查状态见[安全说明](safety.md)。停止发布后，SDK 可能继续执行或保持最后目标。
 
 ## English
 
-Deployment separates GPU inference, an SSH tunnel and the local ROS/vendor-SDK bridge. Bind inference to loopback only; the reference HTTP service has no public-facing authentication. In multi-node clusters, tunnel to the node actually running the service.
+Deployment separates GPU inference, an SSH tunnel and the local ROS/vendor-SDK bridge. The HTTP service binds to loopback without authentication. In multi-node clusters, forward the tunnel to the execution node.
 
-Keep checkpoint, training config, robot mapping and normalization from the same run. Historical hashes/step assertions are provenance checks, not arbitrary configuration to bypass. The policy uses bf16, ten denoising steps and 50 absolute seven-dimensional targets. The reference service job requests one GPU at normal priority; adjust its two-hour historical limit explicitly if needed, rather than assuming a reservation remains active.
+Load checkpoint, training config, robot mapping and normalization from the same run. Configure their bindings in `contract.py`. Inference uses bf16, ten denoising steps and 50 seven-dimensional absolute targets. The service job requests one GPU with `nice=0` and a two-hour default time limit, configurable through `#SBATCH --time`.
 
-Stop teleoperation before policy control. Start exactly one follower SDK in `normal` mode with the topic/node bindings shown above; startup may home the arm. Obtain live RGB and follower state, then run the read-only preview before operator-authorized execution. The demonstration-specific return tool is not a generic safe homing tool.
+Stop teleoperation and start the follower SDK in `normal` mode with the bindings above. Startup can home the arm. Once RGB and follower state are available, `raw_preview.sh` saves predictions without publishing targets. Return tools use this experiment's initial pose and a fixed SDK layout.
 
-The foreground `task500.sh --execute --confirm-clear --sdk-log ...` command enables motion: 50 targets per fresh observation, maximum 500. Thirty Hz refers to publication inside each segment; inference adds gaps. Enter records operator-reported completion, not automatic task success. Record evaluations separately, preserve command evidence and disclose intervention. SDK saturation/interpolation still applies. Commented-out feedback checks are not active protection, and stopping publication is not an emergency stop.
+Run `task500.sh --execute --confirm-clear --sdk-log ...` in an interactive terminal after preparing the robot and workspace. Each fresh observation produces 50 targets, with a 500-target maximum. Thirty Hz applies within each segment; inference adds gaps. Enter ends the run and records completion. Evaluations use separate test-only recordings. SDK saturation/interpolation applies, and the SDK can retain its last target after publication stops. See [safety](safety.md) for current feedback checks.

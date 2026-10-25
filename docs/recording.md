@@ -18,7 +18,7 @@ ROS_DOMAIN_ID=85 ROS_LOCALHOST_ONLY=1 ros2 launch orbbec_camera gemini_301_serie
   config_file_path:=$(pwd)/runtime/host/config/gemini305_rgbd_30fps.yaml
 ```
 
-`camera_1` 是腕部，`camera_2` 是外部，不要中途交换。使用 `ros2 run rqt_image_view rqt_image_view` 查看两路 `/camera_N/color/image_raw`；分别核实视野、无遮挡、848×530 和约 30 FPS。`ros2 topic hz` 测到的是订阅到达节拍，不是曝光同步证明。
+`camera_1` 为腕部，`camera_2` 为外部。使用 `ros2 run rqt_image_view rqt_image_view` 查看两路 `/camera_N/color/image_raw`，检查视野、848×530 分辨率和约 30 FPS 的到达节拍。两相机使用软件时间戳对齐。
 
 ### 批量录制
 
@@ -35,22 +35,22 @@ bash runtime/host/batch_record.sh \
   --task "Put the charger in the box" --episodes 30 --max-seconds 60
 ```
 
-交互流程：回车开始 → 示范 → 回车结束 → 输入 `s` 成功、`f` 失败、`d` 丢弃但保留、`u` 不确定 → 下一条；空闲时 `q` 结束整批。条数是本批上限，不保证有效成功条数。停止录制不会停止机械臂或遥操。
+交互流程：回车开始 → 示范 → 回车结束 → 输入 `s` 成功、`f` 失败、`d` 丢弃但保留、`u` 不确定 → 下一条；空闲时 `q` 结束整批。`--episodes` 为本批录制上限。录制与遥操独立运行。
 
-每条结束核实 bag 已正常关闭，最终看到 `SESSION_CLOSED`。失败或不要的条目保留原始文件及标签，训练选择时排除，不靠手工删除/重编号。统一任务文字、相机位置、分辨率、机器人定义及单位；每条完整展示任务，重置动作尽量不混入任务段。提前用 `df -h` 核查磁盘，raw RGB bag 可能很大。
+每批结束输出 `SESSION_CLOSED`。失败和丢弃回合保留原始文件，数据选择时按标签排除。相同任务各批次使用一致的指令、相机安装、分辨率和机器人定义。每条覆盖完整任务，环境重置放在录制间隙。
 
-默认目录为生成工具旁 `recordings/r5_session_.../`，可通过 `--output-root` 改到专用数据盘。录制不自动上传。人工 success 不代表数据已通过训练验收。
+默认目录为工具旁的 `recordings/r5_session_.../`，可通过 `--output-root` 指定数据盘。录制前用 `df -h` 检查空间；raw RGB 占用较大。上传和数据质量检查是独立步骤。
 
 ### 上传与校验
 
-`upload_batch.py` 是原现场环境的参考：需要配置自己的 SSH 目标和服务器目录，审查其 decoder/template 路径；不会自动删除数据。`--process` 会提交 CPU 校验作业，不应未经查看就使用。普通 Linux 上传可先使用：
+`upload_batch.py` 使用配置中的 SSH 目标、服务器目录与 decoder 路径；`--process` 在上传后提交 CPU 校验作业。Linux 上传也可使用 rsync：
 
 ```bash
 rsync -rt --partial --info=progress2 /path/to/r5_session_example/ \
   robot@server.example.invalid:/srv/r5/real_robot/r5/batches/r5_session_example/
 ```
 
-目标必须是同一个 session，避免覆盖其他批次；保留目录层级，对全部文件做 SHA256 校验后再处理，不能用“rsync 退出 0”代替源/目标逐文件核验。
+每批使用独立的 session 目录，保留原始层级。上传后比较源端和目标端的逐文件 SHA256。
 
 Windows PowerShell 可使用系统 OpenSSH 与 tar，先打包再传：
 
@@ -62,11 +62,11 @@ scp .\r5_session_example.tar robot@server.example.invalid:/srv/r5/incoming/
 ssh robot@server.example.invalid "sha256sum /srv/r5/incoming/r5_session_example.tar"
 ```
 
-人工比较两端 SHA 一致；检查 `tar -tf` 内容没有绝对路径或 `..`，再解到新建的独立目录。上传私钥或密码不是本流程的一部分。不要删除本机原件直到服务器原始文件和备份均确认。
+比较两端 SHA，用 `tar -tf` 检查归档使用相对路径且不含 `..`，然后解压到独立目录。本机原件保留至服务器校验及备份完成。
 
 ### 评测录像与导出
 
-模型执行时，另开终端录制 `--test-only`、`--episodes 1`、适当 `--max-seconds`，指定独立 `--output-root`；该录制不要混入训练。
+模型执行时，另开终端，使用 `--test-only`、`--episodes 1` 和所需的 `--max-seconds`，指定独立 `--output-root`。测试录制在训练选择时自动排除。
 
 关闭录制后，在 ROS 环境离线导出，不重放到话题：
 
@@ -76,14 +76,14 @@ ssh robot@server.example.invalid "sha256sum /srv/r5/incoming/r5_session_example.
   --output /path/to/new_export_directory
 ```
 
-若导出明确报告时间戳间隙，先保留报告；确需观看副本时，`--allow-timestamp-gaps` 会重复最近帧并可视标注。不能将这种导出作为训练时间对齐通过。保留 `frame_timestamps.csv`、`export_report.json` 和原始 MCAP。
+遇到时间戳间隙时，`--allow-timestamp-gaps` 可重复最近帧并添加可视标注。导出同时保存 `frame_timestamps.csv` 和 `export_report.json`。MP4 用于观看，训练对齐直接使用原始 MCAP。
 
 ## English
 
-Launch wrist `camera_1` and external `camera_2` using their serial numbers and the pinned Orbbec launch file above. Check views, resolution and frame arrival rates independently. Identical FPS is not synchronized exposure. Depth may run in the camera driver but is not recorded by default.
+Launch wrist `camera_1` and external `camera_2` using their serial numbers and the pinned Orbbec launch file above. Check views, 848×530 resolution and approximately 30 FPS arrival rates. Views are aligned using software timestamps. The driver can run depth, but recording uses RGB by default.
 
-Run a test-only batch first. For demonstrations, Enter starts/stops an episode; label `s/f/d/u`, then continue or quit with `q` while idle. Recording does not command or stop the robot. Preserve rejected episodes and labels; do not renumber to hide failures. Keep task text, camera mounting, robot definition and units consistent, and check disk capacity.
+Run a test-only batch first. Enter starts/stops an episode; label `s/f/d/u`, then continue or quit with `q` while idle. Recording runs independently of teleoperation. Failed/discarded episodes remain on disk and are excluded by labels. Keep task text, camera mounting, robot definition and units consistent, with resets between recordings. Check disk capacity for raw RGB storage.
 
-No automatic upload occurs. Upload closed sessions, preserve directory structure and verify every file with SHA256. The historical upload script requires site-specific review. PowerShell users can tar, hash, scp and compare the server hash before safely extracting into a new directory. Never upload credentials.
+Upload and data validation are separate from recording. Preserve session directories and compare per-file SHA256 values. Configure the upload script's SSH/server/decoder paths for the site. PowerShell users can tar, hash, scp, compare the server hash and extract into a new directory. Retain local originals until server verification and backup finish.
 
-Use test-only recording for policy evaluations. Export closed bags with the read-only MP4 tool; it creates a viewing derivative, never a ROS replay. Explicit gap handling repeats and annotates frames. Preserve originals and timing reports; an export is not training acceptance.
+Use test-only recording for policy evaluations. Export closed bags with the MP4 tool. Optional gap handling repeats and annotates frames; timing tables and reports accompany the video. Training alignment uses original MCAP data.

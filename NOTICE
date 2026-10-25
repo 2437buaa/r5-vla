@@ -2,9 +2,5 @@ R5 VLA
 R5 real-robot workflow toolkit, 2026.
 
 This project integrates with LingBot-VLA 2.0, ARX R5 and Orbbec SDKs.
-Upstream projects are independently owned and do not endorse this project.
 The modified ARX ROS wrapper retains BSD-3-Clause terms and attribution.
 See THIRD_PARTY_NOTICES.md and integrations/arx/LICENSE.ARX.
-
-No raw demonstrations, model weights, private credentials or vendor binaries
-are distributed in this repository. Research prototype; not safety-certified.

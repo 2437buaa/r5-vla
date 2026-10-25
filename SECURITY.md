@@ -1,9 +1,13 @@
 # Security / 安全信息
 
-Do not post secrets, network addresses or unredacted recordings in issues. Report suspected credential exposure privately to the repository owner; rotate the credential, then review history. Deleting a file from the latest commit does not remove it from history.
+## Inference service / 推理服务
 
-不要在 Issue 中发布密钥、内网地址或未经脱敏的录制。发现凭据泄漏应私下联系仓库所有者，先轮换凭据再检查历史。仅删除最新版本文件不能消除 Git 历史中的泄漏。
+The inference service binds to `127.0.0.1` and uses SSH forwarding for remote access. The HTTP API has no authentication and is intended for loopback access only.
 
-Model inference binds to loopback and is accessed through SSH forwarding. Do not expose the unauthenticated reference HTTP service on a public interface. Robot startup and motion require a local operator; stopping a Python process is not a certified emergency stop.
+推理服务绑定 `127.0.0.1`，远程连接使用 SSH 隧道。HTTP API 无认证，仅用于回环访问。
 
-模型推理服务只绑定回环地址，通过 SSH 隧道访问。不要将参考代码中无认证的 HTTP 服务公开到网络。硬件启动与运动需要现场操作员，退出 Python 不等于可靠急停。
+## Local configuration / 本地配置
+
+Credentials stay in the local SSH configuration. Site configuration, recordings, models and runtime logs are excluded from Git. Report security issues privately to the repository maintainer.
+
+连接凭据由本地 SSH 配置管理。site 配置、录制、模型和运行日志不纳入 Git。安全问题请私下联系仓库维护者。
