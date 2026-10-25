@@ -8,7 +8,7 @@
 
 ## 中文
 
-奶龙陆战队的 R5 真机工程记录与工具集：两台同型号 R5 一主一从采集示范，两台 Gemini 305 提供腕部和外部 RGB 视角，基于 LingBot-VLA 2.0 独立训练，部署时由模型控制一台从臂。
+R5 真机工程记录与工具集：两台同型号 R5 一主一从采集示范，两台 Gemini 305 提供腕部和外部 RGB 视角，基于 LingBot-VLA 2.0 独立训练，部署时由模型控制一台从臂。
 
 包含批量 MCAP 录制、人工标签、从臂与双相机时间对齐、数据校验、双视图 MP4 导出、双 GPU 训练参考、远程推理和原厂 SDK 执行桥。默认不录深度；不包含原始示范、视频、权重、密钥或原厂二进制。
 
@@ -18,7 +18,7 @@
 
 ## English
 
-An engineering toolkit and reproducibility record by Team Nailong: collect demonstrations with two identical ARX R5 arms in leader–follower teleoperation, observe the follower with wrist and external Gemini 305 RGB cameras, train a dedicated LingBot-VLA 2.0 policy, and deploy it on one follower arm.
+An engineering toolkit and reproducibility record for ARX R5: collect demonstrations with two identical arms in leader–follower teleoperation, observe the follower with wrist and external Gemini 305 RGB cameras, train a dedicated LingBot-VLA 2.0 policy, and deploy it on one follower arm.
 
 Includes batched MCAP recording, human labels, camera/follower alignment, dataset checks, dual-view MP4 export, two-GPU training references, remote inference and a vendor-SDK execution bridge. Depth recording is off by default. Raw demonstrations, videos, weights, credentials and vendor binaries are excluded.
 

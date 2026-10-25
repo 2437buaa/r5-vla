@@ -2,7 +2,7 @@
 
 ## 中文
 
-整理日期：2026-10-25，北京时间。团队：奶龙陆战队。此仓库从原工程白名单导出，不携带原工作区 Git 历史、账号配置、日志、原始数据、视频或模型权重。原运行目录未被迁移或修改。
+整理日期：2026-10-25，北京时间。此仓库从原工程白名单导出，不携带原工作区 Git 历史、账号配置、日志、原始数据、视频或模型权重。原运行目录未被迁移或修改。
 
 源码来源见 `provenance/source-manifest.json`：每项记录原文件 SHA256 和脱敏模板 SHA256。脱敏仅替换路径、设备序列号与服务器身份，不重新实现控制逻辑。服务器上实际使用的训练脚本（含 `prepare_checked.py`）与实际 `train.yaml` 已补齐，不只依赖本机较早副本。
 
@@ -25,7 +25,7 @@
 
 ## English
 
-Prepared on 2026-10-25 (Asia/Shanghai) by Team Nailong. This allowlisted export excludes original Git history, account settings, logs, raw data, videos and weights. Original runtime directories are unchanged.
+Prepared on 2026-10-25 (Asia/Shanghai). This allowlisted export excludes original Git history, account settings, logs, raw data, videos and weights. Original runtime directories are unchanged.
 
 The manifest stores original and tokenized source hashes. Export changes paths/device/site identity only, not control logic. Actual server training scripts, including `prepare_checked.py`, and the real training YAML are included as sanitized references.
 
